@@ -154,8 +154,19 @@ TEMPLATE = r"""<!DOCTYPE html>
   .trash-item button:hover { color:var(--ink); border-color:var(--ink); }
   .badge { display:inline-block; font-size:10px; border-radius:10px; padding:1px 8px;
     border:1px solid var(--dim); color:var(--dim); }
-  .badge.open { border-color:var(--accent); color:var(--accent); }
+  .badge.open, .badge.haunting { border-color:var(--accent); color:var(--accent); }
+  .badge.haunting { background:var(--accent); color:#fff; }
   .badge.landed { border-color:#5a8f5a; color:#5a8f5a; }
+  .badge.followed { border-color:#5a8f5a; color:#5a8f5a; }
+  .badge.pending { border-color:var(--accent); color:var(--accent); }
+  .promise-item { display:flex; align-items:baseline; gap:10px; padding:10px 2px;
+    border-top:1px solid var(--line); font-size:13px; line-height:1.7; }
+  .promise-item .t { flex:1; }
+  .promise-item .m { font-size:11px; color:var(--dim); white-space:nowrap; }
+  @media (max-width:640px) {
+    .promise-item { flex-wrap:wrap; }
+    .promise-item .m { white-space:normal; width:100%; }
+  }
   .idea-detail { background:#fff; border:1px solid var(--line); border-radius:10px;
     padding:16px 18px; margin-top:14px; }
   .idea-detail .t { font-size:16px; font-weight:600; line-height:1.8; }
@@ -188,6 +199,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div class="tabbar">
   <button data-tab="daily" class="on">日报</button>
   <button data-tab="ideas">想法看板</button>
+  <button data-tab="promises">承诺</button>
 </div>
 
 <div id="view-daily">
@@ -232,6 +244,11 @@ TEMPLATE = r"""<!DOCTYPE html>
     <h2 style="margin-top:32px">回收站 <span style="font-weight:400;color:var(--dim);font-size:12px">归档的想法在这里，可以恢复</span></h2>
     <div id="trashList"></div>
   </div>
+</div>
+
+<div id="view-promises" style="display:none">
+  <div class="kpis" id="promiseKpis" style="margin-top:20px"></div>
+  <div id="promiseList"></div>
 </div>
 
 <div class="footer" id="footer"></div>
@@ -299,23 +316,33 @@ function buildIdeas() {
         if (!idea || !idea.text) continue;
         const key = normIdea(idea.text);
         if (!byKey[key]) byKey[key] = { key, text: idea.text, title: idea.title || idea.text.slice(0, 10), occurrences: [] };
-        byKey[key].occurrences.push({ date: d.date, status: idea.status, title: idea.title, session: s });
+        const occ = byKey[key].occurrences;
+        // 同一 session 跨日投影只算一次提及（取最早一天），否则"萦绕"被投影放大
+        if (!occ.some(o => o.session.ref === s.ref))
+          occ.push({ date: d.date, status: idea.status, title: idea.title, session: s });
       }
     }
   }
   const items = Object.values(byKey);
   for (const it of items) {
-    // 状态优先级：任何一次 open 即 open，其次 unclear / abandoned / landed
+    it.occurrences.sort((a, b) => a.date.localeCompare(b.date));
+    // 状态以最新一次提及为准（open 不再永久压过 landed）；同日按优先级取
+    const latestDate = it.occurrences.slice(-1)[0].date;
+    const latestStatuses = it.occurrences.filter(o => o.date === latestDate).map(o => o.status);
     it.status = ['open', 'unclear', 'abandoned', 'landed']
-      .find(st => it.occurrences.some(o => o.status === st)) || 'unclear';
-    it.firstDate = it.occurrences.map(o => o.date).sort()[0];
-    it.lastDate = it.occurrences.map(o => o.date).sort().slice(-1)[0];
+      .find(st => latestStatuses.includes(st)) || 'unclear';
+    it.firstDate = it.occurrences[0].date;
+    it.lastDate = latestDate;
+    // 萦绕：反复提起（≥3 次）+ 拖了很久（≥2 周）还没落地——潜意识真正在意的事
+    const spanDays = (new Date(it.lastDate) - new Date(it.firstDate)) / 86400000;
+    it.haunting = it.status === 'open' && it.occurrences.length >= 3 && spanDays >= 14;
     // 标题取最近一次提及的（最新措辞），兜底前 10 字
     const latest = it.occurrences.slice().sort((a, b) => b.date.localeCompare(a.date))[0];
     it.title = (latest && latest.title) || it.text.slice(0, 10);
     it.related = relatedSessions(it);
   }
-  items.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]
+  items.sort((a, b) => (b.haunting - a.haunting)
+    || STATUS_ORDER[a.status] - STATUS_ORDER[b.status]
     || b.lastDate.localeCompare(a.lastDate));
   return items;
 }
@@ -360,7 +387,7 @@ function renderBoard() {
   $('#ideaBoard').innerHTML = visible.length ? visible.map((it) => `
     <div class="idea-card" data-key="${esc(it.key)}">
       <button class="trash-btn" data-trash="${esc(it.key)}" title="归档到回收站">🗑</button>
-      <span class="badge ${it.status}">${STATUS_CN[it.status]}</span>
+      ${it.haunting ? '<span class="badge haunting">萦绕</span>' : `<span class="badge ${it.status}">${STATUS_CN[it.status]}</span>`}
       <div class="title">${esc(it.title)}</div>
       <div class="t">${esc(it.text)}</div>
       <div class="m">首次 ${it.firstDate.slice(5)} · 提及 ${it.occurrences.length} 次 · 相关会话 ${it.related.length}</div>
@@ -409,18 +436,82 @@ function showIdea(key) {
 }
 $('#ideaBack').onclick = e => { e.preventDefault(); renderBoard(); };
 
+// 承诺对账：L1 卡的 commitments + 后续是否有同主题会话（热点标签重叠，确定性近似）
+// review 修正：排除承诺来源 session 自身（跨日投影会自己当自己的"后续"）；
+// 同日但时间更晚的其他会话也算后续；KPI 措辞诚实化为"有下文率"
+function buildPromises() {
+  const byKey = {};
+  for (const d of DATA) {
+    for (const s of d.sessions) {
+      for (const text of ((s.digest && s.digest.commitments) || [])) {
+        if (typeof text !== 'string' || !text) continue;
+        const key = normIdea(text);
+        if (!byKey[key]) byKey[key] = { key, text, date: d.date, labels: new Set(),
+                                        refs: new Set(), latestStart: '' };
+        const p = byKey[key];
+        for (const l of ((s.digest && s.digest.hotspot_labels) || [])) p.labels.add(l);
+        p.refs.add(s.ref);
+        if (d.date < p.date) p.date = d.date;
+        if (s.started_at && s.started_at > p.latestStart) p.latestStart = s.started_at;
+      }
+    }
+  }
+  const items = Object.values(byKey);
+  for (const p of items) {
+    const later = new Set();
+    for (const d of DATA) {
+      for (const s of d.sessions) {
+        if (p.refs.has(s.ref)) continue;                    // 排除承诺来源自身
+        if (d.date < p.date) continue;
+        if (d.date === p.date && p.latestStart && s.started_at && s.started_at <= p.latestStart)
+          continue;  // 同日只认时间上更晚的其他会话
+        if (((s.digest && s.digest.hotspot_labels) || []).some(l => p.labels.has(l)))
+          later.add(d.date);
+      }
+    }
+    p.followDays = later.size;
+    p.followed = later.size > 0;
+  }
+  items.sort((a, b) => b.date.localeCompare(a.date));
+  return items;
+}
+const PROMISES = buildPromises();
+
+function renderPromises() {
+  const total = PROMISES.length;
+  const followed = PROMISES.filter(p => p.followed).length;
+  const rate = total ? Math.round(followed / total * 100) : 0;
+  $('#promiseKpis').innerHTML = [
+    [total, '许下的承诺'],
+    [followed, '有下文'],
+    [total - followed, '悬着'],
+    [rate + '%', '有下文率*'],
+  ].map(([n, l]) => `<div class="kpi"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+  $('#promiseList').innerHTML = (PROMISES.length ? PROMISES.map(p => `
+    <div class="promise-item">
+      <span class="badge ${p.followed ? 'followed' : 'pending'}">${p.followed ? '有下文' : '悬着'}</span>
+      <span class="t">${esc(p.text)}</span>
+      <span class="m">${p.date.slice(5)}${p.followed ? ` · 后续 ${p.followDays} 天有同主题活动` : ''}</span>
+    </div>`).join('')
+    : '<div style="color:var(--dim);font-size:13px;padding:10px 2px">还没有捕捉到承诺。</div>')
+    + '<div style="color:var(--dim);font-size:11px;padding-top:14px">* 有下文率 = 承诺日之后出现同主题（热点标签重叠）会话的比例，是确定性近似，不等于承诺被兑现。统计范围为最近 90 个记录日。</div>';
+}
+
 // tab 切换
 function switchTab(name) {
   document.querySelectorAll('.tabbar button').forEach(x =>
     x.classList.toggle('on', x.dataset.tab === name));
   $('#view-daily').style.display = name === 'daily' ? '' : 'none';
   $('#view-ideas').style.display = name === 'ideas' ? '' : 'none';
+  $('#view-promises').style.display = name === 'promises' ? '' : 'none';
   if (name === 'ideas') renderBoard();
+  if (name === 'promises') renderPromises();
 }
 document.querySelectorAll('.tabbar button').forEach(b => {
-  b.onclick = () => switchTab(b.dataset.tab);
+  b.onclick = () => { switchTab(b.dataset.tab); history.replaceState(null, '', '#' + b.dataset.tab); };
 });
 if (location.hash === '#ideas') switchTab('ideas');
+if (location.hash === '#promises') switchTab('promises');
 
 // 异常检测（确定性规则，不依赖 LLM）
 function detectAnomalies() {
