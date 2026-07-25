@@ -1,0 +1,11 @@
+data/
+web/index.html
+web/deep/
+web/self-track-canvas.html
+__pycache__/
+*.pyc
+.DS_Store
+Kimi_Agent_日常对话洞察系统/zerofriction_build/
+*.docx
+*.pdf
+zerofriction_cost_chart.png

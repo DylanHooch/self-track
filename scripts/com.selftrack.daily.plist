@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 安装：cp 本文件 ~/Library/LaunchAgents/com.selftrack.daily.plist
+     launchctl load ~/Library/LaunchAgents/com.selftrack.daily.plist
+     立即测试：launchctl start com.selftrack.daily
+     卸载：launchctl unload ~/Library/LaunchAgents/com.selftrack.daily.plist
+     StartCalendarInterval 在睡眠/合盖唤醒后会补跑（cron 会静默跳过） -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.selftrack.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jingquanhu/sideProject/self-track/scripts/daily-run.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/jingquanhu/sideProject/self-track</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>7</integer>
+    <key>Minute</key><integer>23</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/jingquanhu/sideProject/self-track/data/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jingquanhu/sideProject/self-track/data/launchd.err.log</string>
+</dict>
+</plist>
