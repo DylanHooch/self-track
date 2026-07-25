@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .aggregate import atomic_write_text
@@ -20,6 +21,111 @@ def _safe_inline_json(obj) -> str:
     return (json.dumps(obj, ensure_ascii=False)
             .replace("<", "\\u003c").replace(">", "\\u003e")
             .replace(" ", "\\u2028").replace(" ", "\\u2029"))
+
+
+def _git_last_commit(cwd: str) -> str | None:
+    """项目目录的 git 最后提交时间（只读探测，落地证据用）。
+    `-- .` 限定到该路径，避免子目录拿到外层仓库无关提交（review 修正）。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "log", "-1", "--format=%cI", "--", "."],
+            capture_output=True, text=True, timeout=2)
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def compute_projects(db: DB) -> list[dict]:
+    """按 cwd 聚合项目：会话数、活跃区间（session_day_stats 事实层）、热点标签、git 证据。
+
+    review 修正：活跃区间取跨日真实活动；伪项目（WorkBuddy 临时目录/tmp）过滤；
+    git 探测并发 + 路径限定；cwd realpath 归一。
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    home = os.path.expanduser("~")
+
+    def normalize(cwd: str) -> str | None:
+        if not cwd:
+            return None
+        if cwd.startswith("~"):
+            cwd = home + cwd[1:]
+        cwd = cwd.rstrip("/") or "/"   # '/' rstrip 后是空串，realpath('') 会污染成进程 cwd
+        if cwd in ("/", "/tmp", "/private/tmp") or cwd.startswith("/private/tmp/"):
+            return None
+        cwd = os.path.realpath(cwd)
+        # 只过滤 WorkBuddy 的时间戳临时目录（YYYY-MM-DD-HH-MM-SS），不误伤真实项目
+        if cwd.startswith(home + "/WorkBuddy/") \
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}", Path(cwd).name):
+            return None
+        return cwd
+
+    rows = db.conn.execute(
+        "SELECT cwd, source, digest_json, started_at FROM sessions WHERE cwd IS NOT NULL AND cwd != ''"
+    ).fetchall()
+    # 活跃区间用事实层 session_day_stats（跨日会话真实活动范围）
+    day_rows = db.conn.execute(
+        """SELECT s.cwd AS cwd, MIN(d.day) AS first_day, MAX(d.day) AS last_day
+           FROM sessions s JOIN session_day_stats d
+             ON s.source=d.source AND s.session_id=d.session_id
+           WHERE s.cwd IS NOT NULL AND s.cwd != '' GROUP BY s.cwd"""
+    ).fetchall()
+    activity = {}
+    for r in day_rows:
+        c = normalize(r["cwd"])
+        if not c:
+            continue
+        cur = activity.get(c)
+        activity[c] = (min(cur[0], r["first_day"]), max(cur[1], r["last_day"])) if cur \
+            else (r["first_day"], r["last_day"])
+
+    projects: dict[str, dict] = {}
+    for r in rows:
+        cwd = normalize(r["cwd"])
+        if not cwd:
+            continue
+        p = projects.setdefault(cwd, {
+            "name": Path(cwd).name or cwd, "cwd": cwd, "n_sessions": 0,
+            "sources": set(), "labels": {},
+        })
+        p["n_sessions"] += 1
+        p["sources"].add(r["source"])
+        if r["digest_json"]:
+            try:
+                card = json.loads(r["digest_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(card, dict):
+                continue
+            labels = card.get("hotspot_labels")
+            if not isinstance(labels, list):  # int/str 等异常结构直接跳过（review 修正）
+                continue
+            for label in labels:
+                if isinstance(label, str):
+                    p["labels"][label] = p["labels"].get(label, 0) + 1
+
+    out = []
+    cwds = [c for c in projects if Path(c).is_dir()]
+    with ThreadPoolExecutor(max_workers=8) as pool:  # 并发探测，避免串行 N×timeout
+        git_results = dict(zip(cwds, pool.map(_git_last_commit, cwds)))
+    for cwd, p in projects.items():
+        exists = Path(cwd).is_dir()
+        first, last = activity.get(cwd, ("", ""))
+        sorted_labels = sorted(p["labels"].items(), key=lambda kv: (-kv[1], kv[0]))
+        out.append({
+            "name": p["name"], "cwd": cwd,
+            "n_sessions": p["n_sessions"],
+            "sources": sorted(p["sources"]),
+            "labels": [label for label, _ in sorted_labels[:6]],
+            "labels_all": [label for label, _ in sorted_labels[:30]],
+            "first": first, "last": last,
+            "exists": exists,
+            "git_last": git_results.get(cwd) if exists else None,
+        })
+    out.sort(key=lambda x: (x["last"] or "", x["n_sessions"]), reverse=True)
+    return out
 
 
 def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) -> Path:
@@ -53,6 +159,7 @@ def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) 
             else:
                 deep_fresh.append(key)  # 孤儿页（session 已不在库），保留链接
     payload = {"days": payload_days, "deep_pages": deep_fresh, "deep_stale": deep_stale,
+               "projects": compute_projects(db),
                "built_at": __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")}
     html = TEMPLATE.replace("/*__DATA__*/", _safe_inline_json(payload))
     out = web_dir / "index.html"
@@ -172,6 +279,11 @@ TEMPLATE = r"""<!DOCTYPE html>
   .idea-detail .t { font-size:16px; font-weight:600; line-height:1.8; }
   .idea-detail .desc { font-size:13px; color:var(--dim); line-height:1.8; margin-top:6px; }
   .idea-detail .m { font-size:12px; color:var(--dim); margin-top:8px; }
+  .proj-card .cwd { font-size:10px; color:var(--dim); word-break:break-all; margin-top:2px; }
+  .proj-card .chips { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
+  .evidence { margin-top:12px; padding:10px 14px; border-left:3px solid #5a8f5a;
+    background:#fff; border-radius:0 8px 8px 0; font-size:12px; line-height:1.8; }
+  .evidence.none { border-left-color:var(--line); color:var(--dim); }
   .back { font-size:12px; color:var(--dim); text-decoration:none; }
   /* ——— 批注 / callout / 页脚 ——— */
   .annot { width:100%; min-height:56px; margin-top:10px; border:1px dashed var(--line);
@@ -199,6 +311,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div class="tabbar">
   <button data-tab="daily" class="on">日报</button>
   <button data-tab="ideas">想法看板</button>
+  <button data-tab="projects">项目</button>
   <button data-tab="promises">承诺</button>
 </div>
 
@@ -237,6 +350,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div id="ideaView" style="display:none">
     <p><a class="back" href="#" id="ideaBack">← 返回想法看板</a></p>
     <div class="idea-detail" id="ideaDetail"></div>
+    <div id="ideaEvidence" style="margin-top:12px"></div>
     <h2 style="margin-top:28px">相关会话</h2>
     <div class="sess" id="ideaSessions"></div>
   </div>
@@ -251,12 +365,17 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div id="promiseList"></div>
 </div>
 
+<div id="view-projects" style="display:none">
+  <div class="idea-grid" id="projectBoard" style="margin-top:20px"></div>
+</div>
+
 <div class="footer" id="footer"></div>
 
 <script id="data" type="application/json">/*__DATA__*/</script>
 <script>
 const PAYLOAD = JSON.parse(document.getElementById('data').textContent);
 const DATA = PAYLOAD.days;
+const PROJECTS = PAYLOAD.projects || [];
 const DEEP = new Set(PAYLOAD.deep_pages || []);
 const DEEP_STALE = new Set(PAYLOAD.deep_stale || []);
 const BUILT_AT = PAYLOAD.built_at || '';
@@ -431,6 +550,13 @@ function showIdea(key) {
     <div class="desc">${esc(it.text)}</div>
     <div class="m">首次出现 ${it.firstDate} · 最近 ${it.lastDate} · 提及 ${it.occurrences.length} 次${link}</div>`;
   $('#ideaDetail').querySelector('[data-trash]').onclick = () => archiveIdea(it.key);
+  // 落地证据：✅ 只给名字强匹配且提交日期 ≥ 首次记录日的项目；标签命中的只列相关
+  const projs = ideaProjects(it);
+  $('#ideaEvidence').innerHTML = projs.length ? projs.map(p =>
+    `<div class="evidence${p.evidence ? '' : ' none'}">${p.evidence ? '✅' : '📁'} <b>${esc(p.name)}</b>` +
+    (p.git_last ? ` · git 最后提交 ${p.git_last.slice(0, 10)}` : ' · 无 git 记录') +
+    (p.evidence ? '（提交日期 ≥ 首次记录日，日级近似，仅作线索）' : (p.labelHit && !p.nameHit ? '（标签相关，弱关联）' : '')) + '</div>'
+  ).join('') : '<div class="evidence none">当前启发式未匹配到相关项目</div>';
   renderCards($('#ideaSessions'),
     it.related.map(r => ({ ...r.s, _date: r.date })));
 }
@@ -497,6 +623,42 @@ function renderPromises() {
     + '<div style="color:var(--dim);font-size:11px;padding-top:14px">* 有下文率 = 承诺日之后出现同主题（热点标签重叠）会话的比例，是确定性近似，不等于承诺被兑现。统计范围为最近 90 个记录日。</div>';
 }
 
+// 项目看板：真实目录 + git 证据
+function renderProjects() {
+  $('#projectBoard').innerHTML = PROJECTS.length ? PROJECTS.map(p => `
+    <div class="idea-card proj-card">
+      <div class="title">${esc(p.name)}</div>
+      <div class="cwd">${esc(p.cwd)}</div>
+      <div class="m">
+        ${p.n_sessions} 个会话 · ${esc(p.sources.join(' / '))}<br>
+        ${p.first ? `活跃 ${p.first} → ${p.last}` : '活跃时间未知'}
+        ${p.git_last ? `<br>git 最后提交 ${p.git_last.slice(0, 10)}` : (p.exists ? '<br>（无 git 提交记录）' : '<br>（目录已不存在）')}
+      </div>
+      <div class="chips">${(p.labels || []).map(l => `<span class="badge">${esc(l)}</span>`).join('')}</div>
+    </div>`).join('')
+    : '<div style="color:var(--dim);font-size:13px">没有项目数据。</div>';
+}
+
+// 想法 ↔ 项目匹配：项目名出现在想法文本（强信号），或项目标签与出处会话标签重叠（弱信号）
+// review 修正：名字匹配守卫落在归一化后的长度上（normIdea('..')/('@')→'' 时 includes('') 恒真）
+function ideaProjects(it) {
+  const text = normIdea(it.text + it.title);
+  const originLabels = new Set();
+  for (const o of it.occurrences)
+    for (const l of ((o.session.digest && o.session.digest.hotspot_labels) || []))
+      originLabels.add(l);
+  return PROJECTS
+    .map(p => {
+      const nn = normIdea(p.name);
+      const nameHit = nn.length >= 2 && text.includes(nn);
+      const labelHit = (p.labels_all || p.labels || []).some(l => originLabels.has(l));
+      // ✅ 落地证据只给强信号（名字命中）且 git 提交日期不早于首次记录日（日级近似）
+      return { ...p, nameHit, labelHit,
+               evidence: !!(nameHit && p.git_last && p.git_last.slice(0, 10) >= it.firstDate) };
+    })
+    .filter(p => p.nameHit || p.labelHit);
+}
+
 // tab 切换
 function switchTab(name) {
   document.querySelectorAll('.tabbar button').forEach(x =>
@@ -504,14 +666,17 @@ function switchTab(name) {
   $('#view-daily').style.display = name === 'daily' ? '' : 'none';
   $('#view-ideas').style.display = name === 'ideas' ? '' : 'none';
   $('#view-promises').style.display = name === 'promises' ? '' : 'none';
+  $('#view-projects').style.display = name === 'projects' ? '' : 'none';
   if (name === 'ideas') renderBoard();
   if (name === 'promises') renderPromises();
+  if (name === 'projects') renderProjects();
 }
 document.querySelectorAll('.tabbar button').forEach(b => {
   b.onclick = () => { switchTab(b.dataset.tab); history.replaceState(null, '', '#' + b.dataset.tab); };
 });
 if (location.hash === '#ideas') switchTab('ideas');
 if (location.hash === '#promises') switchTab('promises');
+if (location.hash === '#projects') switchTab('projects');
 
 // 异常检测（确定性规则，不依赖 LLM）
 function detectAnomalies() {
