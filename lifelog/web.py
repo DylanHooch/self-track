@@ -794,7 +794,7 @@ function renderDay() {
   const q = $('#sessFilter').value || '';
   const filtered = ordered.filter(s => sessionMatches(s, q));
   renderCards($('#sessions'), filtered);
-  if (q && !$('#sessFilter').dataset.bound) {
+  if (!$('#sessFilter').dataset.bound) {  // 无条件绑定：否则空筛选时首次渲染后输入无反应
     $('#sessFilter').dataset.bound = '1';
     $('#sessFilter').oninput = () => renderDay();  // 输入即重筛当前天
   }
