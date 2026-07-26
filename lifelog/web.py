@@ -137,29 +137,11 @@ def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) 
             payload_days.append(json.loads((daily_dir / f"{day}.json").read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             continue
-    # 已生成的深度分析页：对照 manifest 水位判断新鲜/陈旧（review 修正）
-    from .deepdive import safe_page_key
-    deep_dir = web_dir / "deep"
-    deep_fresh, deep_stale = [], []
-    if deep_dir.is_dir():
-        try:
-            manifest = json.loads((deep_dir / "manifest.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
-        wm = {safe_page_key(r["source"], r["session_id"]): (r["raw_mtime"], r["raw_size"])
-              for r in db.conn.execute("SELECT source, session_id, raw_mtime, raw_size FROM sessions")}
-        for p in sorted(deep_dir.glob("*.html")):
-            key = p.stem
-            cur = wm.get(key)
-            gen = manifest.get(key)
-            if cur and gen and (gen.get("raw_mtime"), gen.get("raw_size")) == cur:
-                deep_fresh.append(key)
-            elif cur:
-                deep_stale.append(key)  # 会话已更新，页面陈旧
-            else:
-                deep_fresh.append(key)  # 孤儿页（session 已不在库），保留链接
-    payload = {"days": payload_days, "deep_pages": deep_fresh, "deep_stale": deep_stale,
-               "projects": compute_projects(db),
+    # 深度页：为全部 session 重建（未分析=stub 页，已分析=完整页带陈旧标记）。
+    # 页面是 manifest/DB 的投影，可整体重建；分析本身只在用户点「首次/增量分析」时发生。
+    from .deepdive import render_all_pages
+    render_all_pages(db, web_dir)
+    payload = {"days": payload_days, "projects": compute_projects(db),
                "built_at": __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")}
     html = TEMPLATE.replace("/*__DATA__*/", _safe_inline_json(payload))
     out = web_dir / "index.html"
@@ -376,8 +358,6 @@ TEMPLATE = r"""<!DOCTYPE html>
 const PAYLOAD = JSON.parse(document.getElementById('data').textContent);
 const DATA = PAYLOAD.days;
 const PROJECTS = PAYLOAD.projects || [];
-const DEEP = new Set(PAYLOAD.deep_pages || []);
-const DEEP_STALE = new Set(PAYLOAD.deep_stale || []);
 const BUILT_AT = PAYLOAD.built_at || '';
 // 与 deepdive.py safe_page_key 同规则：session_id 不可信，过滤危险字符
 function pageKey(source, sid) { return `${source}-${sid}`.replace(/[^A-Za-z0-9._-]/g, '_'); }
@@ -541,8 +521,7 @@ function showIdea(key) {
   $('#ideaBoard').style.display = 'none';
   $('#ideaView').style.display = '';
   const first = it.occurrences.slice().sort((a, b) => a.date.localeCompare(b.date))[0];
-  const page = first ? pageKey(first.session.source, first.session.session_id) : '';
-  const link = first && DEEP.has(page) ? ` · <a href="deep/${page}.html" style="color:var(--accent)">出处详情 →</a>` : '';
+  const link = first ? ` · <a href="deep/${pageKey(first.session.source, first.session.session_id)}.html" style="color:var(--accent)">出处详情 →</a>` : '';
   $('#ideaDetail').innerHTML = `
     <span class="badge ${it.status}">${STATUS_CN[it.status]}</span>
     <button class="trash-btn" data-trash="${esc(it.key)}" title="归档到回收站" style="position:static;float:right">🗑</button>
@@ -809,11 +788,6 @@ function renderCards(container, list) {
   list.forEach(s => { if (s._imp === undefined) s._imp = importance(s); });
   container.innerHTML = list.map((x, i) => {
     const page = pageKey(x.source, x.session_id);
-    const deep = DEEP.has(page)
-      ? `<a class="deep" href="deep/${page}.html">深度 →</a>`
-      : DEEP_STALE.has(page)
-        ? `<span class="deep" data-deep="${esc(x.source)}|${esc(x.session_id)}">↻ 重新生成</span>`
-        : `<span class="deep" data-deep="${esc(x.source)}|${esc(x.session_id)}">深度</span>`;
     return `
     <div class="card${x._imp < 0 ? ' chore' : ''}" data-i="${i}">
       <span class="copied">已复制 ✓</span>
@@ -821,19 +795,11 @@ function renderCards(container, list) {
       <div class="t">${esc(x.title || '(无标题)')}</div>
       ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
       <div class="meta"><span>${(x.started_at || '').slice(11, 16)}</span><span>${x.n_user_msgs} 条消息</span></div>
-      ${deep}
+      <a class="deep" href="deep/${page}.html">深度 →</a>
     </div>`;
   }).join('');
   container.querySelectorAll('.card').forEach(card => {
     card.onclick = () => copyText(resumeText(list[+card.dataset.i]), card);
-  });
-  // 深度分析入口：新鲜页面走链接（上面 a 标签），陈旧/没有则复制生成命令
-  container.querySelectorAll('[data-deep]').forEach(el => {
-    el.onclick = e => {
-      e.stopPropagation();
-      const [src, sid] = el.dataset.deep.split('|');
-      copyText(`LIFELOG_LLM_BACKEND=kimi-code python3 -m lifelog deep-dive ${shq(src)} ${shq(sid)}`, el.closest('.card'));
-    };
   });
   container.querySelectorAll('a.deep').forEach(el => {
     el.onclick = e => e.stopPropagation();

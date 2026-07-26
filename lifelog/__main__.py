@@ -6,6 +6,7 @@ commands:
   build-web  生成 web/index.html
   run        scan + digest（LLM 整理）+ report + build-web（每日完整流程）
   deep-dive  单会话深度分析页：python -m lifelog deep-dive <source> <session_id>
+  sessions   按 cwd 过滤会话：python -m lifelog sessions <cwd>（支持 ~ 与子目录前缀）
 """
 from __future__ import annotations
 
@@ -118,6 +119,35 @@ def cmd_deep_dive() -> int:
     return 0
 
 
+def cmd_sessions() -> int:
+    """按 cwd 过滤会话：python -m lifelog sessions <cwd>（支持 ~ 与子目录前缀）"""
+    import os
+    if len(sys.argv) < 3:
+        print("用法: python -m lifelog sessions <cwd>（支持 ~）", file=sys.stderr)
+        return 1
+    target = os.path.realpath(os.path.expanduser(sys.argv[2]).rstrip("/"))
+    db = _open_db()
+    try:
+        rows = db.conn.execute(
+            "SELECT source, session_id, title, cwd, started_at, n_user_msgs, digest_status "
+            "FROM sessions WHERE cwd IS NOT NULL ORDER BY started_at DESC").fetchall()
+        hits = []
+        for r in rows:
+            cwd = os.path.realpath(os.path.expanduser(r["cwd"].rstrip("/") or "/"))
+            if cwd == target or cwd.startswith(target + "/"):
+                hits.append(r)
+        if not hits:
+            print(f"没有 cwd 在 {target} 下的会话")
+            return 0
+        for r in hits:
+            print(f"{(r['started_at'] or '')[:16]}  {r['source']:<10} u={r['n_user_msgs']:<3} "
+                  f"{r['digest_status']:<8} {r['session_id'][:8]}  {(r['title'] or '')[:60]}")
+        print(f"共 {len(hits)} 个会话（{target}）")
+    finally:
+        db.close()
+    return 0
+
+
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     with RunLock():
@@ -131,6 +161,8 @@ def main() -> int:
             return cmd_run()
         if cmd == "deep-dive":
             return cmd_deep_dive()
+        if cmd == "sessions":
+            return cmd_sessions()
     print(__doc__, file=sys.stderr)
     return 1
 
