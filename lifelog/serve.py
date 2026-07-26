@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -27,8 +28,9 @@ DATA = ROOT / "data"
 MAX_BODY = 16 * 1024
 
 _analyze_lock = threading.Lock()  # 串行分析与 token 刷新（kimi 后端本就不适合并发）
-_in_progress: set[str] = set()
 _last_refresh = [0.0]
+DISPATCH = Path.home() / ".agents/skills/agent-dispatch/scripts/dispatch"
+ANALYZE_TIMEOUT = 1800  # 30min，dispatch 侧超时
 
 
 def _refresh_kimi_token():
@@ -46,12 +48,52 @@ def _refresh_kimi_token():
             pass
 
 
+def _dispatch_status(label: str) -> str:
+    """查 dispatch 任务状态：running / success / failed / unknown。"""
+    try:
+        r = subprocess.run([str(DISPATCH), "jobs", "--label", label],
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        m = re.search(r"status=(\w+)", r.stdout)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _start_analysis(source: str, sid: str) -> str:
+    """用 agent-dispatch 后台跑深度分析（30min 超时），返回任务 label。
+    serve 进程不阻塞；前端轮询 /api/deep-dive/status 直到完成。"""
+    from .deepdive import safe_page_key
+    label = "deep-" + safe_page_key(source, sid)[:44]
+    task = (f"在 /Users/jingquanhu/sideProject/self-track 目录执行命令：\n"
+            f"LIFELOG_LLM_BACKEND=kimi-code python3 -m lifelog deep-dive {source} {sid}\n"
+            f"这是 self-track 的单会话深度分析。命令成功后把 stdout 末尾总结原样报告；"
+            f"失败则报告完整错误输出。不要修改任何其他文件。")
+    log = DATA / "deep-dispatch.log"
+    with open(log, "ab") as lf:
+        subprocess.Popen(
+            [str(DISPATCH), "submit", "--label", label, "--role", "kimi",
+             "--task", task, "--timeout", str(ANALYZE_TIMEOUT)],
+            stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, start_new_session=True)
+    return label
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB), **kwargs)
 
     def log_message(self, fmt, *args):
-        pass  # 安静
+        pass  # 安静（API 错误另有 stderr 日志）
+
+    def do_GET(self):
+        if self.path.startswith("/api/deep-dive/status"):
+            from urllib.parse import parse_qs, urlparse
+            label = parse_qs(urlparse(self.path).query).get("label", [""])[0]
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", label):
+                self._json(400, {"ok": False, "error": "bad label"})
+                return
+            self._json(200, {"ok": True, "state": _dispatch_status(label)})
+            return
+        super().do_GET()
 
     def _origin_ok(self) -> bool:
         """只接受本机来源：Host 必须是本服务，Origin 缺失（同源 fetch）或本机。
@@ -95,26 +137,18 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(404, {"ok": False, "error": f"找不到会话 {source}:{sid}"})
             return
         key = f"{source}:{sid}"
-        if key in _in_progress:
-            self._json(409, {"ok": False, "error": "该会话正在分析中"})
+        from .deepdive import safe_page_key
+        label = "deep-" + safe_page_key(source, sid)[:44]
+        if _dispatch_status(label) == "running":
+            self._json(200, {"ok": True, "started": True, "label": label, "already": True})
             return
         try:
-            _in_progress.add(key)
-            with _analyze_lock:
-                _refresh_kimi_token()
-                db = DB(DATA / "lifelog.sqlite")
-                try:
-                    out = deep_dive(db, source, sid, WEB)
-                finally:
-                    db.close()
-            self._json(200, {"ok": True, "page": out.name})
-        except SystemExit as e:
-            self._json(400, {"ok": False, "error": str(e)})
+            _refresh_kimi_token()  # 先刷 token，dispatch 里的 kimi agent 才有得用
+            label = _start_analysis(source, sid)
+            self._json(200, {"ok": True, "started": True, "label": label})
         except Exception as e:
             print(f"[serve] POST /api/deep-dive 500: {e}", file=sys.stderr)
             self._json(500, {"ok": False, "error": str(e)[:300]})
-        finally:
-            _in_progress.discard(key)
 
     def _json(self, code: int, obj: dict):
         data = json.dumps(obj, ensure_ascii=False).encode()
@@ -125,7 +159,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def serve(open_browser: bool = True) -> int:
+def serve(open_browser: bool = False) -> int:
     os.environ.setdefault("LIFELOG_LLM_BACKEND", "kimi-code")
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

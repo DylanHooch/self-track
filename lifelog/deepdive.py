@@ -235,16 +235,40 @@ function toast(t) {{
 async function goAnalyze() {{
   if (!IS_APP) {{ copyCmd(); return; }}  // file:// 打开时退回复制命令
   const btns = document.querySelectorAll('.btn');
-  btns.forEach(b => {{ b.disabled = true; b.textContent = '分析中…'; }});
+  btns.forEach(b => {{ b.disabled = true; b.textContent = '分析排队中…'; }});
+  let label = null;
   try {{
     const r = await fetch('/api/deep-dive', {{ method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{ source: SRC, session_id: SID }}) }});
     const d = await r.json();
-    if (d.ok) {{ location.reload(); return; }}
-    toast('分析失败：' + (d.error || r.status));
-  }} catch (e) {{ toast('请求失败：' + e); }}
-  btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }});
+    if (!d.ok) {{ toast('启动失败：' + (d.error || r.status));
+      btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }}); return; }}
+    label = d.label;
+  }} catch (e) {{ toast('请求失败：' + e);
+    btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }}); return; }}
+  // 后台执行（agent-dispatch，30min 超时），轮询状态
+  const t0 = Date.now();
+  const timer = setInterval(async () => {{
+    const mins = ((Date.now() - t0) / 60000).toFixed(0);
+    btns.forEach(b => {{ b.textContent = `分析中…（已 ${{mins}} 分钟）`; }});
+    try {{
+      const r = await fetch('/api/deep-dive/status?label=' + encodeURIComponent(label));
+      const d = await r.json();
+      if (d.state === 'success') {{ clearInterval(timer); location.reload(); return; }}
+      if (d.state === 'failed' || d.state === 'unknown' && Date.now() - t0 > 120000) {{
+        clearInterval(timer);
+        toast('分析失败或超时，请查看 data/deep-dispatch.log');
+        btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }});
+        return;
+      }}
+    }} catch (e) {{ /* 网络抖动继续等 */ }}
+    if (Date.now() - t0 > 31 * 60000) {{
+      clearInterval(timer);
+      toast('分析超时（30 分钟），请查看 data/deep-dispatch.log');
+      btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }});
+    }}
+  }}, 5000);
 }}
 function copyCmd() {{
   const cmd = {_js_string(cmd)};
