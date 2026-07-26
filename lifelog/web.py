@@ -272,6 +272,10 @@ TEMPLATE = r"""<!DOCTYPE html>
     border-radius:10px; background:transparent; padding:10px 12px; font-size:13px;
     font-family:inherit; color:var(--ink); resize:vertical; }
   .annot:focus { outline:none; border-color:var(--accent); }
+  .filter { width:100%; border:1px solid var(--line); border-radius:10px;
+    background:#fff; padding:8px 12px; font-size:13px; font-family:inherit;
+    color:var(--ink); margin-bottom:12px; }
+  .filter:focus { outline:none; border-color:var(--accent); }
   .callout { border-left:3px solid var(--accent); background:#fff;
     border-radius:0 8px 8px 0; padding:10px 14px; margin-bottom:10px; font-size:13px; line-height:1.7; }
   .callout .t { font-weight:600; font-size:12px; color:var(--accent); }
@@ -323,6 +327,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <section>
   <h2>会话 <span style="font-weight:400;color:var(--dim);font-size:12px">点击卡片复制 resume 指令 · 点「深度」看单会话分析</span></h2>
+  <input class="filter" id="sessFilter" placeholder="筛选：标题 / cwd（支持 ~）/ 来源…">
   <div class="sess" id="sessions"></div>
 </section>
 </div><!-- /view-daily -->
@@ -780,7 +785,28 @@ function renderDay() {
     else store.del('lifelog-note-' + d.date);
   };
 
-  renderCards($('#sessions'), ordered);
+  const q = $('#sessFilter').value || '';
+  const filtered = ordered.filter(s => sessionMatches(s, q));
+  renderCards($('#sessions'), filtered);
+  if (q && !$('#sessFilter').dataset.bound) {
+    $('#sessFilter').dataset.bound = '1';
+    $('#sessFilter').oninput = () => renderDay();  // 输入即重筛当前天
+  }
+}
+
+// 会话筛选：标题/cwd/来源 子串匹配；~ 开头展开为 home（从项目 cwd 推断）
+const HOME_DIR = (() => {
+  for (const p of PROJECTS) { const m = (p.cwd || '').match(/^\/Users\/[^/]+/); if (m) return m[0]; }
+  return '/Users';
+})();
+function sessionMatches(s, q) {
+  if (!q) return true;
+  q = q.trim().toLowerCase();
+  if (q.startsWith('~')) q = (HOME_DIR + q.slice(1)).toLowerCase();
+  return ((s.title || '').toLowerCase().includes(q)
+    || (s.cwd || '').toLowerCase().includes(q)
+    || (s.project || '').toLowerCase().includes(q)
+    || (s.source || '').toLowerCase().includes(q));
 }
 
 // 通用会话卡片渲染（日报会话列表 + 想法视图的相关会话共用）
