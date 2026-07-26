@@ -127,17 +127,16 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
         if stale_new > 0:
             action_html = (
                 f"<div class='stale'>⚠ 分析之后又有 <b>{stale_new}</b> 条新消息。"
-                f"<button class='btn' onclick='copyCmd()'>增量分析（复制命令）</button></div>")
+                f"<button class='btn' onclick='goAnalyze()'>增量分析</button></div>")
         elif stale_new < 0:
             action_html = ("<div class='stale'>⚠ 源文件不可用或解析失败，无法判断是否有新消息；"
                            "分析内容为上次生成时的状态。</div>")
         else:
             action_html = "<div class='dim'>分析已是最新。</div>"
     else:
-        analysis_html = ("<p class='dim'>这个会话还没有深度分析。点击下面按钮复制命令，"
-                         "到终端执行后刷新本页即可看到分析。</p>")
+        analysis_html = ("<p class='dim' id='stubHint'>这个会话还没有深度分析。</p>")
         scope = "未分析"
-        action_html = "<button class='btn primary' onclick='copyCmd()'>首次分析（复制命令）</button>"
+        action_html = "<button class='btn primary' onclick='goAnalyze()'>首次分析</button>"
 
     card_html = ""
     if card and card.get("what"):
@@ -200,6 +199,7 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
   .btn {{ border:1px solid var(--accent); color:var(--accent); background:#fff;
          border-radius:14px; padding:4px 14px; font-size:12px; cursor:pointer; margin-left:8px; }}
   .btn.primary {{ margin-left:0; margin-top:10px; padding:6px 18px; font-size:13px; }}
+  .btn:disabled {{ opacity:.6; cursor:default; border-color:var(--dim); color:var(--dim); }}
   #toast {{ position:fixed; bottom:30px; left:50%; transform:translateX(-50%);
     background:var(--ink); color:#fff; padding:8px 20px; border-radius:20px;
     font-size:13px; opacity:0; transition:opacity .25s; pointer-events:none; }}
@@ -221,12 +221,34 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
 <div class="footer">由 lifelog deep-dive 生成 · {now_iso()} · 数字为代码确定性计算，分析为 LLM 产出 · 页面可由 manifest 重建</div>
 <div id="toast"></div>
 <script>
+const SRC = {_js_string(source)}, SID = {_js_string(sid)};
+const IS_APP = location.protocol === 'http:';
+if (IS_APP) {{
+  const hint = document.getElementById('stubHint');
+  if (hint) hint.textContent = '这个会话还没有深度分析。点击下方按钮，k3 会在本机直接完成分析。';
+}}
+function toast(t) {{
+  const el = document.getElementById('toast');
+  el.textContent = t; el.style.opacity = 1;
+  setTimeout(() => el.style.opacity = 0, 3000);
+}}
+async function goAnalyze() {{
+  if (!IS_APP) {{ copyCmd(); return; }}  // file:// 打开时退回复制命令
+  const btns = document.querySelectorAll('.btn');
+  btns.forEach(b => {{ b.disabled = true; b.textContent = '分析中…（k3 正在读这个会话）'; }});
+  try {{
+    const r = await fetch('/api/deep-dive', {{ method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ source: SRC, session_id: SID }}) }});
+    const d = await r.json();
+    if (d.ok) {{ location.reload(); return; }}
+    toast('分析失败：' + (d.error || r.status));
+  }} catch (e) {{ toast('请求失败：' + e); }}
+  btns.forEach(b => {{ b.disabled = false; b.textContent = '重试分析'; }});
+}}
 function copyCmd() {{
   const cmd = {_js_string(cmd)};
-  const toast = document.getElementById('toast');
-  const show = t => {{ toast.textContent = t; toast.style.opacity = 1;
-    setTimeout(() => toast.style.opacity = 0, 2500); }};
-  const done = () => show('命令已复制，到终端执行后刷新本页');
+  const done = () => toast('命令已复制，到终端执行后刷新本页');
   if (navigator.clipboard && navigator.clipboard.writeText)
     navigator.clipboard.writeText(cmd).then(done).catch(() => legacy(cmd, done));
   else legacy(cmd, done);
@@ -234,7 +256,7 @@ function copyCmd() {{
     const ta = document.createElement('textarea');
     ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
     document.body.appendChild(ta); ta.select();
-    try {{ document.execCommand('copy'); cb(); }} catch (e) {{ show('复制失败，请手动执行：' + t); }}
+    try {{ document.execCommand('copy'); cb(); }} catch (e) {{ toast('复制失败，请手动执行：' + t); }}
     document.body.removeChild(ta);
   }}
 }}

@@ -7,6 +7,7 @@ commands:
   run        scan + digest（LLM 整理）+ report + build-web（每日完整流程）
   deep-dive  单会话深度分析页：python -m lifelog deep-dive <source> <session_id>
   sessions   按 cwd 过滤会话：python -m lifelog sessions <cwd>（支持 ~ 与子目录前缀）
+  serve      本地 web 应用（默认 :8791），页面可直接触发深度分析
 """
 from __future__ import annotations
 
@@ -163,6 +164,9 @@ def main() -> int:
             return cmd_deep_dive()
         if cmd == "sessions":
             return cmd_sessions()
+        if cmd == "serve":
+            from .serve import serve
+            return serve()
     print(__doc__, file=sys.stderr)
     return 1
 
