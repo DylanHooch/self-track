@@ -333,6 +333,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 </div><!-- /view-daily -->
 
 <div id="view-ideas" style="display:none">
+  <input class="filter" id="ideaFilter" placeholder="筛选想法：标题 / 描述 / 状态（未落地、已落地…）" style="margin-top:20px">
   <div class="idea-grid" id="ideaBoard"></div>
   <div id="ideaView" style="display:none">
     <p><a class="back" href="#" id="ideaBack">← 返回想法看板</a></p>
@@ -487,7 +488,11 @@ function renderBoard() {
   $('#ideaView').style.display = 'none';
   $('#ideaBoard').style.display = '';
   const trash = getTrash();
-  const visible = IDEAS.filter(it => !trash.has(it.key));
+  const q = ($('#ideaFilter').value || '').trim().toLowerCase();
+  const visible = IDEAS.filter(it => !trash.has(it.key)
+    && (!q || it.title.toLowerCase().includes(q)
+        || it.text.toLowerCase().includes(q)
+        || STATUS_CN[it.status].includes(q)));
   $('#ideaBoard').innerHTML = visible.length ? visible.map((it) => `
     <div class="idea-card" data-key="${esc(it.key)}">
       <button class="trash-btn" data-trash="${esc(it.key)}" title="归档到回收站">🗑</button>
@@ -545,6 +550,7 @@ function showIdea(key) {
     it.related.map(r => ({ ...r.s, _date: r.date })));
 }
 $('#ideaBack').onclick = e => { e.preventDefault(); renderBoard(); };
+$('#ideaFilter').oninput = () => renderBoard();
 
 // 承诺对账：L1 卡的 commitments + 后续是否有同主题会话（热点标签重叠，确定性近似）
 // review 修正：排除承诺来源 session 自身（跨日投影会自己当自己的"后续"）；
