@@ -235,7 +235,7 @@ function toast(t) {{
 async function goAnalyze() {{
   if (!IS_APP) {{ copyCmd(); return; }}  // file:// 打开时退回复制命令
   const btns = document.querySelectorAll('.btn');
-  btns.forEach(b => {{ b.disabled = true; b.textContent = '分析中…（k3 正在读这个会话）'; }});
+  btns.forEach(b => {{ b.disabled = true; b.textContent = '分析中…'; }});
   try {{
     const r = await fetch('/api/deep-dive', {{ method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},

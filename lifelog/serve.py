@@ -2,13 +2,16 @@
 
 - 静态服务 web/（看板 + 深度页）
 - POST /api/deep-dive {source, session_id} → 直接在本进程跑深度分析（首次/增量）
-只绑 127.0.0.1，纯标准库。
+安全边界（review 修正）：只绑 127.0.0.1 + Origin/Host 校验（防任意网页跨站触发/
+DNS rebinding）；deep-dive 进程内串行锁（防并发 read-modify-write 丢分析）；
+serve 不持有全局 RunLock（长驻进程会把每日 launchd 流程掐死）。
 """
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import threading
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -21,15 +24,24 @@ PORT = int(os.environ.get("LIFELOG_PORT", "8791"))
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 DATA = ROOT / "data"
+MAX_BODY = 16 * 1024
+
+_analyze_lock = threading.Lock()  # 串行分析与 token 刷新（kimi 后端本就不适合并发）
+_in_progress: set[str] = set()
+_last_refresh = [0.0]
 
 
 def _refresh_kimi_token():
-    """kimi token 短时有效：分析前用 CLI 刷新一次（失败不阻塞，backend 会自己报错）。"""
+    """kimi token 短时有效：分析前用 CLI 刷新（60s 内合并，失败不阻塞）。"""
+    import time
+    if time.time() - _last_refresh[0] < 60:
+        return
     kimi = Path.home() / ".kimi-code" / "bin" / "kimi"
     if kimi.exists():
         try:
             subprocess.run([str(kimi), "-p", "ok"], input=b"ok\n",
                            capture_output=True, timeout=60)
+            _last_refresh[0] = time.time()
         except Exception:
             pass
 
@@ -41,29 +53,68 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # 安静
 
+    def _origin_ok(self) -> bool:
+        """只接受本机来源：Host 必须是本服务，Origin 缺失（同源 fetch）或本机。
+        阻挡恶意网页的 simple-request CSRF 与 DNS rebinding（review 修正）。"""
+        host = self.headers.get("Host", "")
+        if host not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        return origin in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
+
     def do_POST(self):
         if self.path != "/api/deep-dive":
             self._json(404, {"ok": False, "error": "unknown endpoint"})
             return
+        if not self._origin_ok():
+            self._json(403, {"ok": False, "error": "forbidden origin"})
+            return
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            self._json(415, {"ok": False, "error": "Content-Type must be application/json"})
+            return
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-            source, sid = body["source"], body["session_id"]
+            length = int(self.headers.get("Content-Length", 0))
+            if not 0 < length <= MAX_BODY:
+                raise ValueError("bad length")
+            body = json.loads(self.rfile.read(length))
+            source, sid = str(body["source"])[:64], str(body["session_id"])[:128]
         except Exception:
             self._json(400, {"ok": False, "error": "bad request"})
             return
+        # 先本地验证 session 存在，再碰 token/LLM（review：无效 sid 不该触发 kimi CLI）
+        db = DB(DATA / "lifelog.sqlite")
         try:
-            os.environ.setdefault("LIFELOG_LLM_BACKEND", "kimi-code")
-            _refresh_kimi_token()
-            db = DB(DATA / "lifelog.sqlite")
-            try:
-                out = deep_dive(db, source, sid, WEB)
-            finally:
-                db.close()
+            exists = db.conn.execute(
+                "SELECT 1 FROM sessions WHERE source=? AND session_id=?",
+                (source, sid)).fetchone()
+        finally:
+            db.close()
+        if not exists:
+            self._json(404, {"ok": False, "error": f"找不到会话 {source}:{sid}"})
+            return
+        key = f"{source}:{sid}"
+        if key in _in_progress:
+            self._json(409, {"ok": False, "error": "该会话正在分析中"})
+            return
+        try:
+            _in_progress.add(key)
+            with _analyze_lock:
+                _refresh_kimi_token()
+                db = DB(DATA / "lifelog.sqlite")
+                try:
+                    out = deep_dive(db, source, sid, WEB)
+                finally:
+                    db.close()
             self._json(200, {"ok": True, "page": out.name})
         except SystemExit as e:
             self._json(400, {"ok": False, "error": str(e)})
         except Exception as e:
+            print(f"[serve] POST /api/deep-dive 500: {e}", file=sys.stderr)
             self._json(500, {"ok": False, "error": str(e)[:300]})
+        finally:
+            _in_progress.discard(key)
 
     def _json(self, code: int, obj: dict):
         data = json.dumps(obj, ensure_ascii=False).encode()
@@ -76,7 +127,11 @@ class Handler(SimpleHTTPRequestHandler):
 
 def serve(open_browser: bool = True) -> int:
     os.environ.setdefault("LIFELOG_LLM_BACKEND", "kimi-code")
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        print(f"端口 {PORT} 被占用（已有 selftrack 在运行？可用 LIFELOG_PORT 换端口）")
+        return 1
     url = f"http://127.0.0.1:{PORT}/"
     print(f"self-track 本地应用：{url}（Ctrl+C 停止）")
     if open_browser:
@@ -88,3 +143,4 @@ def serve(open_browser: bool = True) -> int:
     finally:
         server.server_close()
     return 0
+

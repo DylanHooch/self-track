@@ -14,11 +14,13 @@ from .db import DB, now_iso
 
 
 def atomic_write_text(path: Path, text: str):
-    """tmp + rename，避免崩溃留下截断文件。"""
+    """tmp + rename，避免崩溃留下截断文件；tmp 名带进程与随机后缀，并发写不互踩。"""
+    import tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_name, path)
 
 
 def compute_daily(db: DB, day: str) -> dict:

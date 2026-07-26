@@ -8,8 +8,8 @@
 
 ```bash
 cd /Users/jingquanhu/sideProject/self-track
-LIFELOG_LLM_BACKEND=kimi-code python3 -m lifelog run
-open web/index.html
+python3 -m lifelog serve    # 本地应用 :8791，页面直触深度分析
+# 或：LIFELOG_LLM_BACKEND=kimi-code python3 -m lifelog run && open web/index.html
 ```
 
 - 中断、崩溃、一周没开机：重跑同一命令即可，自动补全缺失日期。

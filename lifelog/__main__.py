@@ -151,6 +151,10 @@ def cmd_sessions() -> int:
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    # serve 是长驻进程：不能持有全局 RunLock，否则会掐死 launchd 每日 run（review 修正）
+    if cmd == "serve":
+        from .serve import serve
+        return serve()
     with RunLock():
         if cmd == "scan":
             return cmd_scan()
@@ -164,9 +168,6 @@ def main() -> int:
             return cmd_deep_dive()
         if cmd == "sessions":
             return cmd_sessions()
-        if cmd == "serve":
-            from .serve import serve
-            return serve()
     print(__doc__, file=sys.stderr)
     return 1
 
