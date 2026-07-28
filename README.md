@@ -25,9 +25,9 @@ lifelog/            代码（纯 Python 标准库，零依赖）
   db.py             SQLite 权威存储（+ dirty_days 持久化恢复）
   digest.py         LLM 整理（L1 会话卡 / L2 日叙事 / 预筛）
   aggregate.py      日统计投影（确定性计算）
-  web.py            前端构建（单 HTML，数据内联）
+  web.py            前端构建（数据内联进 index.html；样式/逻辑/3D 在 web/ 静态文件）
 data/               lifelog.sqlite + stats/daily/*.json（gitignore）
-web/index.html      产物，双击即开
+web/index.html      产物，双击即开（3D 暮色山径 hero，依赖同目录 style.css/app.js/scene3d.js/vendor/assets）
 docs/               调研、schema、review 合并记录、决策记录
 scripts/            launchd 模板
 ```
