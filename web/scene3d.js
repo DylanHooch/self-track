@@ -42,7 +42,7 @@
   }
   var fbm = makeNoise(7);
 
-  // ——— 地形参数 ———
+  // ——— 地形参数：小径 = 山脊线，两侧下落（路碑/行者永远不被前景山遮挡）———
   var PATH_X0 = -58, PATH_X1 = 52;           // 小径起止（压缩到相机视野内）
   var LIGHTHOUSE_X = 66;
   function zPath(x) { return 14 * Math.sin(x * 0.032) + 7 * Math.sin(x * 0.011 + 1.7); }
@@ -50,15 +50,17 @@
     var t = Math.min(1, Math.max(0, (x - a) / (b - a)));
     return t * t * (3 - 2 * t);
   }
-  function pathBase(x) { return 1.6 * Math.sin(x * 0.045) + fbm(x * 0.02, 0) * 2.2; }
   function terrainH(x, z) {
-    var h = fbm(x * 0.02, z * 0.02) * 15;
-    h *= 0.15 + 0.85 * smoothstep(90, 40, z);                     // 朝相机渐平：近景是低缓前滩
-    h += smoothstep(20, 85, -z) * 14;                             // 只有远山抬高（背景层次）
-    h += smoothstep(28, 66, x) * 10 * smoothstep(60, 20, z);      // 灯塔端抬升（别抬到镜头前）
+    // 主脊线：起伏的脊顶，小径就压在上面
+    var ridge = 13 + 3.5 * Math.sin(x * 0.045) + fbm(x * 0.015, 7.3) * 6;
     var d = Math.abs(z - zPath(x));
-    var corridor = smoothstep(3.5, 16, d);                        // 小径走廊压平
-    return pathBase(x) * (1 - corridor) + h * corridor;
+    var side = smoothstep(2, 34, d);                    // 0=脊顶 1=谷底
+    var valley = -7 + fbm(x * 0.03, z * 0.03) * 5;      // 谷底起伏
+    var h = ridge * (1 - side) + valley * side
+          + fbm(x * 0.02, z * 0.02) * 3.5 * (1 - side * 0.6);
+    h += smoothstep(-45, -95, z) * 16;                  // 远山背景层（更高，做剪影）
+    h += smoothstep(30, 68, x) * 6;                     // 整条脊在灯塔端抬升
+    return h;
   }
 
   // ——— 程序化纹理 ———
@@ -197,27 +199,44 @@
     glowNear.position.set(30, 30, -150);
     scene.add(glowNear);
 
-    // ——— 地形：暗色实体 + 灰蓝线框（山脉图的几何线感）———
-    var TER_W = 300, TER_D = 180, SEG_X = 150, SEG_Z = 90;
+    // ——— 地形：大三角低多边形 + 逐面平涂上色（山脉图的切面感）———
+    // 上色规则：高度决定底色（深navy→灰蓝→雾白），面向光源的面染淡金（黎明从右侧山后打来）
+    var TER_W = 300, TER_D = 180, SEG_X = 52, SEG_Z = 32;   // 大三角：~5.7×5.6 一格
     var terGeo = new THREE.PlaneGeometry(TER_W, TER_D, SEG_X, SEG_Z);
     terGeo.rotateX(-Math.PI / 2);
     var vp = terGeo.attributes.position;
-    var colors = new Float32Array(vp.count * 3);
-    var cLow = C(PALETTE.night2), cHigh = C(PALETTE.slate),
-        cWarm = C(0x9a7a52);
-    for (var i = 0; i < vp.count; i++) {
-      var x = vp.getX(i), z = vp.getZ(i);
-      var h = terrainH(x, z);
-      vp.setY(i, h);
-      var t = Math.min(1, h / 22);
-      var col = cLow.clone().lerp(cHigh, t);
-      // 小径两侧与高处染一点暖色（海报里被灯塔照亮的感觉）
-      var nearPath = 1 - smoothstep(2, 18, Math.abs(z - zPath(x)));
-      col.lerp(cWarm, nearPath * 0.45 + t * 0.12);
-      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
+    for (var i = 0; i < vp.count; i++)
+      vp.setY(i, terrainH(vp.getX(i), vp.getZ(i)));
+    var wireGeo = terGeo.clone();                 // 线框用共享边的网格（少一倍线）
+    terGeo = terGeo.toNonIndexed();               // 断开共享边：逐面平涂的前提
+    terGeo.computeVertexNormals();
+    var np = terGeo.attributes.position, nn = terGeo.attributes.normal;
+    var colors = new Float32Array(np.count * 3);
+    // 高度色带（山脉图：谷底深navy、坡面灰蓝、脊线雾白微金）
+    var ramp = [C(0x131e33), C(0x2c3e57), C(0x5d7389), C(0x93a5b6), C(0xc3cdd6)];
+    var cGold = C(0xe8c98f), cShadow = C(0x0d1522);
+    var lightDir = new THREE.Vector3(0.55, 0.4, -0.72).normalize();  // 光从右后方（灯塔方向）
+    function rampColor(h) {
+      var stops = [-8, 2, 9, 16, 24];  // 与 ramp 一一对应
+      if (h <= stops[0]) return ramp[0].clone();
+      for (var k = 0; k < stops.length - 1; k++) {
+        if (h <= stops[k + 1])
+          return ramp[k].clone().lerp(ramp[k + 1], (h - stops[k]) / (stops[k + 1] - stops[k]));
+      }
+      return ramp[ramp.length - 1].clone();
+    }
+    for (var f = 0; f < np.count; f += 3) {     // 逐三角面：同色平涂
+      var hf = (np.getY(f) + np.getY(f + 1) + np.getY(f + 2)) / 3;
+      var nrm = new THREE.Vector3(nn.getX(f), nn.getY(f), nn.getZ(f));
+      var sun = Math.max(0, nrm.dot(lightDir));
+      var col = rampColor(hf);
+      col.lerp(cShadow, Math.max(0, -nrm.dot(lightDir)) * 0.35);  // 背光面压深
+      col.lerp(cGold, sun * sun * 0.5);                           // 向光面染淡金
+      for (var k2 = 0; k2 < 3; k2++) {
+        colors[(f + k2) * 3] = col.r; colors[(f + k2) * 3 + 1] = col.g; colors[(f + k2) * 3 + 2] = col.b;
+      }
     }
     terGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    terGeo.computeVertexNormals();
     var DEBUG_TERRAIN = /debug-terrain/.test((window.location && location.hash) || '');
     // DoubleSide：相机可能低于山脊（在褶皱里穿行视角），单面会被剔除（实测）
     var terrain = new THREE.Mesh(terGeo, new THREE.MeshBasicMaterial(
@@ -225,9 +244,9 @@
                     : { vertexColors: true, side: THREE.DoubleSide }));
     scene.add(terrain);
     var wire = new THREE.LineSegments(
-      new THREE.WireframeGeometry(terGeo),
+      new THREE.WireframeGeometry(wireGeo),
       new THREE.LineBasicMaterial(DEBUG_TERRAIN ? { color: 0x00ff00 }
-        : { color: C(PALETTE.ridge), transparent: true, opacity: 0.16 }));
+        : { color: C(PALETTE.ridge), transparent: true, opacity: 0.14 }));
     wire.position.y += 0.06;
     scene.add(wire);
 
@@ -375,7 +394,7 @@
     var FIT_HALF_W = 95;  // 含灯塔（66）+ 左右余量
     var camZ = Math.max(58, FIT_HALF_W / (Math.tan(26 * Math.PI / 180) * camera.aspect));
     // 低机位、视线略抬：山脊线压在画面中上部，辉光从山后透出（海报构图）
-    var camBase = { x: 0, y: 24, z: camZ }, lookBase = { x: 4, y: 5, z: -30 };
+    var camBase = { x: 0, y: 26, z: camZ }, lookBase = { x: 4, y: 14, z: -30 };
     var mouse = { x: 0, y: 0 }, focusX = 0, focusTarget = 0;
     camera.position.set(camBase.x, camBase.y, camBase.z);
 
