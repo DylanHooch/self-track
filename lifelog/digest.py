@@ -19,6 +19,13 @@ from pathlib import Path
 from .adapters import all_adapters
 from .db import DB, DIGEST_SCHEMA_VERSION, now_iso, to_day
 
+_LLM_CALLS = [0, 0, 0]  # [次数, 输入token, 输出token]
+
+
+def _bar(i: int, n: int, width: int = 16) -> str:
+    filled = round(i / max(n, 1) * width)
+    return "█" * filled + "░" * (width - filled)
+
 MAX_DIGESTS_PER_RUN = int(os.environ.get("LIFELOG_MAX_DIGESTS", "50"))
 L1_MODEL = os.environ.get("LIFELOG_LLM_MODEL", "k3")
 
@@ -101,9 +108,12 @@ class KimiCodeOAuthBackend:
         with self.opener.open(req, timeout=120) as resp:
             data = json.loads(resp.read())
         usage = data.get("usage") or {}
-        if usage:
-            print(f"  [llm] in={usage.get('prompt_tokens', '?')} "
-                  f"out={usage.get('completion_tokens', '?')}", file=sys.stderr)
+        n_in, n_out = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+        _LLM_CALLS[0] += 1
+        _LLM_CALLS[1] += n_in
+        _LLM_CALLS[2] += n_out
+        print(f"      └─ LLM({L1_MODEL}) 本次：输入 {n_in:,} / 输出 {n_out:,} token",
+              file=sys.stderr)
         return data["choices"][0]["message"]["content"]
 
 
@@ -270,7 +280,7 @@ def run_digest(db: DB) -> set[str]:
     # pending 优先于 failed，防止永久失败的旧 session 饿死新 session（review P1）；
     # done 但 schema 版本过期的卡也重算（review：prompt/schema 升级的自动失效路径）
     rows = db.conn.execute(
-        "SELECT source, session_id, raw_path, raw_mtime, raw_size, n_user_msgs, started_at, ended_at, digest_status "
+        "SELECT source, session_id, raw_path, raw_mtime, raw_size, n_user_msgs, started_at, ended_at, digest_status, title "
         "FROM sessions WHERE digest_status IN ('pending','failed') "
         "   OR (digest_status='done' AND (digest_ver IS NULL OR digest_ver != ?)) "
         "ORDER BY digest_status='pending' DESC, started_at LIMIT ?",
@@ -282,9 +292,13 @@ def run_digest(db: DB) -> set[str]:
 
     # 先跑零 token 的预筛（不需要 backend）
     llm_rows = []
-    for r in rows:
+    n_all = len(rows)
+    for i, r in enumerate(rows, 1):
+        title = (r["title"] or "")[:36]
         reason = should_skip(r["n_user_msgs"], r["started_at"], r["ended_at"])
         if reason:
+            print(f"  【{_bar(i, n_all)} {i}/{n_all}】预筛跳过（{reason}）：{r['source']} {title}",
+                  file=sys.stderr)
             _mark_days_dirty(db, r["source"], r["session_id"])
             db.conn.execute(
                 "UPDATE sessions SET digest_status='skipped', digest_json=?, digest_mtime=?, digest_size=?, digest_ver=? "
@@ -293,7 +307,7 @@ def run_digest(db: DB) -> set[str]:
                  DIGEST_SCHEMA_VERSION, r["source"], r["session_id"]))
             db.conn.commit()
         else:
-            llm_rows.append(r)
+            llm_rows.append((i, r))
 
     # 补齐：有 done 卡但还没有日叙事的日期（上次运行中途被杀也能续上）
     missing = db.conn.execute(
@@ -312,8 +326,11 @@ def run_digest(db: DB) -> set[str]:
             backend = NoneBackend()
 
     if backend.name != "none":
-        for r in llm_rows:
+        for i, r in llm_rows:
             source, sid = r["source"], r["session_id"]
+            title = (r["title"] or "")[:36]
+            print(f"  【{_bar(i, n_all)} {i}/{n_all}】生成会话卡：{source} {title}",
+                  file=sys.stderr)
             try:
                 rs = adapters[source].parse(Path(r["raw_path"]))
                 transcript = build_transcript(rs.messages)
@@ -327,6 +344,7 @@ def run_digest(db: DB) -> set[str]:
                      DIGEST_SCHEMA_VERSION, source, sid))
                 db.conn.commit()
             except Exception as e:
+                print(f"      └─ 失败：{str(e)[:120]}", file=sys.stderr)
                 _mark_days_dirty(db, source, sid)
                 db.conn.execute(
                     "UPDATE sessions SET digest_status='failed', digest_json=? WHERE source=? AND session_id=?",
@@ -335,6 +353,9 @@ def run_digest(db: DB) -> set[str]:
         touched_days |= missing_days
         if touched_days:
             _run_daily_narratives(db, backend, touched_days)
+        if _LLM_CALLS[0]:
+            print(f"  LLM 合计：{_LLM_CALLS[0]} 次调用，"
+                  f"输入 {_LLM_CALLS[1]:,} / 输出 {_LLM_CALLS[2]:,} token", file=sys.stderr)
     elif missing_days:
         # 无 backend：至少把缺叙事的日期标 dirty，投影保持最新硬统计
         db.conn.executemany("INSERT OR IGNORE INTO dirty_days (day) VALUES (?)",
@@ -344,13 +365,17 @@ def run_digest(db: DB) -> set[str]:
 
 
 def _run_daily_narratives(db: DB, backend, days: set[str]):
-    for day in sorted(days):
+    days_sorted = sorted(days)
+    n_days = len(days_sorted)
+    for di, day in enumerate(days_sorted, 1):
         rows = db.conn.execute(
             "SELECT DISTINCT s.source, s.session_id, s.title, s.digest_json FROM sessions s "
             "JOIN session_day_stats d ON s.source=d.source AND s.session_id=d.session_id "
             "WHERE d.day=? AND s.digest_status='done' ORDER BY s.started_at", (day,)).fetchall()
         if not rows:
             continue
+        print(f"  【{_bar(di, n_days)} {di}/{n_days}】总结 {day}（{len(rows)} 张会话卡 → 日叙事）",
+              file=sys.stderr)
         cards = []
         for r in rows:
             card = json.loads(r["digest_json"])

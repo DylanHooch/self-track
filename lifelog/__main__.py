@@ -91,11 +91,15 @@ def cmd_run() -> int:
     from .digest import run_digest
     db = _open_db()
     try:
+        print("【1/4】扫描会话…")
         affected, warnings = scan(db)
+        print("【2/4】LLM 整理（会话卡 + 日叙事）…")
         run_digest(db)  # digest 层自己把触动的日期标 dirty
+        print("【3/4】重算日统计…")
         extra = missing_daily_days(db, DATA / "stats")
         extra.add(to_day(datetime.now().timestamp()))
         written = rebuild_dirty_days(db, DATA / "stats", extra)
+        print("【4/4】生成前端…")
         from .web import build_web
         out = build_web(db, DATA / "stats", WEB)
         print(f"完成：重算 {len(written)} 天，前端 {out}")
