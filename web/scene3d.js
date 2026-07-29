@@ -205,8 +205,17 @@
     var terGeo = new THREE.PlaneGeometry(TER_W, TER_D, SEG_X, SEG_Z);
     terGeo.rotateX(-Math.PI / 2);
     var vp = terGeo.attributes.position;
-    for (var i = 0; i < vp.count; i++)
-      vp.setY(i, terrainH(vp.getX(i), vp.getZ(i)));
+    // 顶点抖动：规整方格 → 不规则三角（种子固定不漂移；边缘少抖保持轮廓）
+    var cellX = TER_W / SEG_X, cellZ = TER_D / SEG_Z;
+    for (var i = 0; i < vp.count; i++) {
+      var jx = vp.getX(i), jz = vp.getZ(i);
+      var edge = Math.min(1, Math.min(Math.abs(jx) / (TER_W / 2), Math.abs(jz) / (TER_D / 2)));
+      var amp = 0.85 * (1 - edge * 0.7);   // 内部抖 85% 格距，边缘递减
+      jx += (fbm(i * 0.173, 3.1) - 0.55) * 2 * cellX * amp;
+      jz += (fbm(9.7, i * 0.211) - 0.55) * 2 * cellZ * amp;
+      vp.setX(i, jx); vp.setZ(i, jz);
+      vp.setY(i, terrainH(jx, jz));
+    }
     var wireGeo = terGeo.clone();                 // 线框用共享边的网格（少一倍线）
     terGeo = terGeo.toNonIndexed();               // 断开共享边：逐面平涂的前提
     terGeo.computeVertexNormals();
@@ -389,21 +398,29 @@
     var stars = makeTwinklePoints(starDefs, glowTex, 0.7);  // 星星是天体：不漂不雾化
     scene.add(flies); scene.add(stars);
 
-    // ——— 相机：低机位 + 鼠标视差 + 选中聚焦 ———
+    // ——— 相机：静止机位 + 选中聚焦；滚轮缩放、拖拽平移（用户二轮反馈：不要鼠标视差）———
     // 视野要覆盖小径全程 + 灯塔：按容器宽高比反推相机距离（宽屏近、窄屏远）
     var FIT_HALF_W = 95;  // 含灯塔（66）+ 左右余量
     var camZ = Math.max(58, FIT_HALF_W / (Math.tan(26 * Math.PI / 180) * camera.aspect));
     // 低机位、视线略抬：山脊线压在画面中上部，辉光从山后透出（海报构图）
     var camBase = { x: 0, y: 26, z: camZ }, lookBase = { x: 4, y: 14, z: -30 };
-    var mouse = { x: 0, y: 0 }, focusX = 0, focusTarget = 0;
+    var focusX = 0, focusTarget = 0;
+    var zoomFactor = 1, panX = 0, panY = 0;   // 滚轮缩放 0.7~1.4，拖拽平移限幅
     camera.position.set(camBase.x, camBase.y, camBase.z);
 
     // 相机定位抽成一处：动画帧与静态帧（减动效）共用，保证构图一致（review 修正）
     function placeCamera(t) {
-      camera.position.x = camBase.x + focusX + mouse.x * 5 + Math.sin(t * 0.09) * 1.8;
-      camera.position.y = camBase.y + mouse.y * 2.2 + Math.sin(t * 0.13) * 0.6;
-      camera.position.z = camBase.z;
-      camera.lookAt(lookBase.x + focusX * 0.8 + mouse.x * 3, lookBase.y + mouse.y * 1.4, lookBase.z);
+      void t;
+      var cz = camBase.z * zoomFactor;
+      camera.position.x = camBase.x + focusX + panX;
+      camera.position.y = camBase.y + panY;
+      camera.position.z = cz;
+      camera.lookAt(lookBase.x + focusX * 0.8 + panX, lookBase.y + panY, lookBase.z);
+    }
+    function clampView() {
+      zoomFactor = Math.min(1.4, Math.max(0.7, zoomFactor));
+      panX = Math.min(36, Math.max(-36, panX));
+      panY = Math.min(12, Math.max(-8, panY));
     }
     var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     function renderStatic() {
@@ -423,31 +440,56 @@
       var hits = raycaster.intersectObjects(hitMeshes, false);
       return hits.length ? hits[0].object.userData.dayIndex : -1;
     }
-    var downPos = null;
-    renderer.domElement.addEventListener('pointerdown', function (e) { downPos = [e.clientX, e.clientY]; });
+    var downPos = null, panStart = null;
+    renderer.domElement.addEventListener('pointerdown', function (e) {
+      downPos = [e.clientX, e.clientY];
+      panStart = { x: panX, y: panY, moved: false };
+    });
     renderer.domElement.addEventListener('pointerup', function (e) {
       if (!downPos) return;
       var moved = Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]);
-      downPos = null;
-      if (moved > 6) return;  // 拖拽不算点击
+      downPos = null; panStart = null;
+      if (moved > 6) return;  // 拖拽平移不算点击
       var idx = pickAt(e.clientX, e.clientY);
       if (idx >= 0 && opts.onPick) opts.onPick(idx);
     });
-    var lastHoverPick = 0;
+    // 滚轮缩放（略微）：阻止页面滚动
+    renderer.domElement.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      zoomFactor *= Math.exp(e.deltaY * 0.0009);
+      clampView();
+      if (reduceMotion) renderStatic();
+    }, { passive: false });
+    var lastHoverPick = 0, lastHoverIdx = null;
     renderer.domElement.addEventListener('pointermove', function (e) {
       var rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-      if (!opts.onHover) return;
-      var now = performance.now();  // 射线拾取节流：视差照跟手，pick 60ms 一次
-      if (now - lastHoverPick < 60) return;
-      lastHoverPick = now;
-      var idx = pickAt(e.clientX, e.clientY);
-      renderer.domElement.style.cursor = idx >= 0 ? 'pointer' : '';
-      opts.onHover(idx >= 0 ? idx : null, e.clientX - rect.left, e.clientY - rect.top);
+      var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      if (downPos && panStart) {          // 拖拽平移（相机与注视点一起平移）
+        var wpp = 2 * camBase.z * zoomFactor * Math.tan(26 * Math.PI / 180) / rect.height;
+        panX = panStart.x - (e.clientX - downPos[0]) * wpp;
+        panY = panStart.y + (e.clientY - downPos[1]) * wpp;
+        clampView();
+        if (reduceMotion) renderStatic();
+        if (lastHoverIdx != null && opts.onHover) {  // 拖拽中收起 tooltip
+          lastHoverIdx = null; opts.onHover(null, mx, my);
+        }
+        return;
+      }
+      var now = performance.now();  // 射线拾取节流 50ms；tooltip 位置每次移动都跟手（分开走，不卡）
+      if (now - lastHoverPick >= 50) {
+        lastHoverPick = now;
+        var idx = pickAt(e.clientX, e.clientY);
+        var newIdx = idx >= 0 ? idx : null;
+        if (newIdx !== lastHoverIdx) {
+          lastHoverIdx = newIdx;
+          renderer.domElement.style.cursor = newIdx != null ? 'pointer' : '';
+          if (opts.onHover) opts.onHover(newIdx, mx, my);
+        }
+      }
+      if (lastHoverIdx != null && opts.onHoverMove) opts.onHoverMove(mx, my);
     });
     renderer.domElement.addEventListener('pointerleave', function () {
-      mouse.x = 0; mouse.y = 0;
+      downPos = null; panStart = null; lastHoverIdx = null;
       if (opts.onHover) opts.onHover(null, 0, 0);
     });
 

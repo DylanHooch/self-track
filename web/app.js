@@ -36,12 +36,15 @@ try {
         switchTab('daily');
         document.getElementById('daySection').scrollIntoView({ behavior: 'smooth', block: 'start' });
       },
-      onHover(i, x, y) {    // 悬停提示：日期 + 会话数
+      onHover(i, x, y) {    // 悬停：路碑变化时才重建内容
         if (i == null) { tipEl.style.display = 'none'; return; }
         const d = DATA[i];
         tipEl.innerHTML = `<b>${esc(d.date)}</b> · ${d.stats.n_sessions} 个会话`;
         tipEl.style.left = x + 'px'; tipEl.style.top = y + 'px';
         tipEl.style.display = 'block';
+      },
+      onHoverMove(x, y) {   // 同一块路碑内移动：只挪位置（每次移动都跟手，不卡顿）
+        tipEl.style.left = x + 'px'; tipEl.style.top = y + 'px';
       },
       onContextLost() {     // GPU 上下文丢失：降级海报 + 2D 路碑
         journey3d = false;
