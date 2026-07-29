@@ -84,6 +84,12 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # 安静（API 错误另有 stderr 日志）
 
+    def end_headers(self):
+        # 本地应用迭代频繁：不发 Cache-Control 时 Chrome 启发式缓存 js/css，
+        # 用户刷新看不到新版（踩过）。no-cache = 每次都回源校验（本机无成本）。
+        self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     def do_GET(self):
         if self.path.startswith("/api/deep-dive/status"):
             from urllib.parse import parse_qs, urlparse
