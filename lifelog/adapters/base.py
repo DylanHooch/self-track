@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
@@ -16,6 +18,78 @@ class Msg:
     role: str          # 'user' | 'assistant'
     text: str
     ts: Optional[float] = None   # epoch seconds
+
+
+# ——— 产物账本抽取（用户决策：产物导向，会话写过什么文件/commit 是确定性事实）———
+# 写文件类工具名（小写）：覆盖 claude/kimi 的 Write/Edit、codex 的 apply_patch 等
+_WRITE_TOOL_NAMES = {
+    "write", "edit", "multiedit", "notebookedit",
+    "apply_patch", "create_file", "str_replace_editor",
+}
+_PATH_KEYS = ("file_path", "path", "filename", "target_file")
+_GIT_COMMIT_RE = re.compile(r"\bgit\s+(?:-C\s+(?P<repo>\S+)\s+)?commit\b")
+_GIT_MSG_RE = re.compile(r"-m\s*(?P<q>['\"])(?P<msg>.*?)(?P=q)", re.S)
+# heredoc 形式：git commit -m "$(cat <<'EOF'\n消息\nEOF\n)"
+_GIT_HEREDOC_MSG_RE = re.compile(
+    r"-m\s+[\"']?\$\(cat\s+<<\s*'?(?P<tag>[A-Za-z_]+)'?\s*\n(?P<msg>.*?)\n(?P=tag)", re.S)
+_PATCH_FILE_RE = re.compile(r"\*\*\* (?:Add|Update) File: (.+)")
+
+
+def _absolutize(p: str, cwd: Optional[str]) -> Optional[str]:
+    """相对路径按会话 cwd 归一为绝对路径；归一不了（无 cwd）则丢弃。"""
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        if not cwd:
+            return None
+        p = os.path.join(cwd, p)
+    return os.path.normpath(p)
+
+
+def note_tool_call(rs: "RawSession", name, args) -> None:
+    """从一次工具调用抽产物线索：写过的文件路径 + git commit。
+
+    args 为 dict 或 JSON 字符串；宽容处理，任何异常静默跳过（产物是增量信息，
+    不允许拖垮会话解析）。
+    """
+    try:
+        if isinstance(args, str):
+            raw = args
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(args, dict):
+            raw = json.dumps(args, ensure_ascii=False)
+        else:
+            return
+        lname = (name or "").lower()
+        if lname in _WRITE_TOOL_NAMES:
+            if lname == "apply_patch":
+                for m in _PATCH_FILE_RE.finditer(raw):
+                    p = _absolutize(m.group(1).strip(), rs.cwd)
+                    if p:
+                        rs.file_writes.append(p)
+            else:
+                for k in _PATH_KEYS:
+                    v = args.get(k)
+                    if isinstance(v, str) and v.strip():
+                        p = _absolutize(v.strip(), rs.cwd)
+                        if p:
+                            rs.file_writes.append(p)
+                        break
+        # shell 类工具：只认 git commit（用户决策：不做时间窗归因，只记会话里出现的）
+        cmd = args.get("command") or args.get("cmd")
+        if isinstance(cmd, list):
+            cmd = " ".join(str(x) for x in cmd)
+        if isinstance(cmd, str):
+            m = _GIT_COMMIT_RE.search(cmd)
+            if m:
+                hm = _GIT_HEREDOC_MSG_RE.search(cmd)
+                msg_m = hm or _GIT_MSG_RE.search(cmd)
+                subject = (msg_m.group("msg").strip().split("\n", 1)[0] if msg_m else "")[:120]
+                rs.commits.append({"repo": m.group("repo") or rs.cwd, "subject": subject})
+    except Exception:
+        pass
 
 
 @dataclass
@@ -37,6 +111,8 @@ class RawSession:
     n_output_tokens: Optional[int] = None
     first_user_msg: Optional[str] = None
     messages: list = field(default_factory=list)  # list[Msg]，digest 用，不落库
+    file_writes: list = field(default_factory=list)  # list[str] 写过的绝对路径，产物账本用
+    commits: list = field(default_factory=list)      # list[dict{repo,subject}]，产物账本用
 
 
 def iter_jsonl(path: Path) -> Iterator[dict]:

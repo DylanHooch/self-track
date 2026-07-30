@@ -348,16 +348,251 @@ function switchTab(name) {
   $('#view-ideas').style.display = name === 'ideas' ? '' : 'none';
   $('#view-promises').style.display = name === 'promises' ? '' : 'none';
   $('#view-projects').style.display = name === 'projects' ? '' : 'none';
+  $('#view-artifacts').style.display = name === 'artifacts' ? '' : 'none';
   if (name === 'ideas') renderBoard();
   if (name === 'promises') renderPromises();
   if (name === 'projects') renderProjects();
+  if (name === 'artifacts') renderArtifacts();
 }
 document.querySelectorAll('.tabbar button').forEach(b => {
   b.onclick = () => { switchTab(b.dataset.tab); history.replaceState(null, '', '#' + b.dataset.tab); };
 });
-if (location.hash === '#ideas') switchTab('ideas');
-if (location.hash === '#promises') switchTab('promises');
-if (location.hash === '#projects') switchTab('projects');
+
+// ——— 产物账本 ———
+// 打包/补路径走 serve 的本地接口，file:// 直开时隐藏按钮并提示
+const ARTIFACTS = PAYLOAD.artifacts || [];
+const ON_SERVE = location.protocol === 'http:' || location.protocol === 'https:';
+const NEED_SERVE_MSG = '这个操作需要通过本地应用打开页面：终端跑 selftrack，或访问 http://127.0.0.1:8791/（file:// 直开只能浏览）';
+function needServe() { if (!ON_SERVE) alert(NEED_SERVE_MSG); return !ON_SERVE; }
+
+function artifactBadge(a) {
+  if (a.kind === 'commit') return '<span class="badge">commit</span>';
+  if (!a.exists) return '<span class="badge pending">已消失</span>';
+  if (a.moved) return '<span class="badge followed">已移动</span>';
+  return '<span class="badge followed">在</span>';
+}
+
+// 产物类型分类（勾选条用，默认不勾 commit）
+const ART_IMG_EXT = new Set('png jpg jpeg gif webp svg heic bmp tiff tif'.split(' '));
+const ART_VIDEO_EXT = new Set('mp4 mov webm avi mkv m4v'.split(' '));
+function artType(a) {
+  if (a.kind === 'commit') return 'commit';
+  const ext = (a.name.match(/\.([^.]+)$/) || ['', ''])[1].toLowerCase();
+  if (ART_IMG_EXT.has(ext)) return 'img';
+  if (ART_VIDEO_EXT.has(ext)) return 'video';
+  return 'doc';  // md/html/pdf/office/txt 等其余白名单扩展都归文档
+}
+
+function renderArtifacts() {
+  $('#artHint').style.display = ON_SERVE ? 'none' : '';
+  const q = ($('#artFilter').value || '').trim().toLowerCase();
+  const types = new Set([...document.querySelectorAll('#artTypeBar input:checked')]
+    .map(x => x.dataset.artType));
+  const visible = ARTIFACTS.filter(a => types.has(artType(a)) && (!q
+    || a.name.toLowerCase().includes(q)
+    || (a.display_path || '').toLowerCase().includes(q)
+    || (a.repo || '').toLowerCase().includes(q)
+    || (a.note || '').toLowerCase().includes(q)));
+  $('#artifactBoard').innerHTML = visible.length ? visible.map(a => `
+    <div class="idea-card" data-id="${a.id}">
+      ${artifactBadge(a)}
+      <div class="title">${esc(a.name)}</div>
+      ${a.note || a.head ? `<div class="t">${esc(a.note || a.head)}</div>` : ''}
+      ${a.display_path ? `<div class="cwd">${esc(a.display_path)}</div>` : ''}
+      <div class="m">${a.first_day.slice(5)}${a.last_day !== a.first_day ? ' → ' + a.last_day.slice(5) : ''} · ${a.sessions.length} 个会话${a.kind === 'commit' && a.repo ? ' · ' + esc(a.repo) : ''}</div>
+      <div class="art-actions">
+        ${a.kind === 'file' && a.exists ? `<button data-preview="${a.id}">预览</button>` : ''}
+        ${a.kind === 'file' ? `<button data-pack="${a.id}">打包</button>` : ''}
+        ${a.kind === 'file' ? `<button data-patch="${a.id}">补路径</button>` : ''}
+        ${a.sessions.map(s =>
+          `<a class="art-src" href="deep/${pageKey(s.source, s.session_id)}.html">${esc(s.source)} · ${esc((s.title || '').slice(0, 24))}</a>`).join('')}
+      </div>
+    </div>`).join('')
+    : '<div style="color:var(--ink-dim);font-size:13px">还没有产物记录（会话写过的文件、执行过的 commit 会出现在这里）。</div>';
+  $('#artifactBoard').querySelectorAll('[data-pack]').forEach(b => {
+    b.onclick = e => { e.stopPropagation(); packArtifacts([+b.dataset.pack]); };
+  });
+  $('#artifactBoard').querySelectorAll('[data-patch]').forEach(b => {
+    b.onclick = e => { e.stopPropagation(); patchArtifactPath(+b.dataset.patch); };
+  });
+  $('#artifactBoard').querySelectorAll('[data-preview]').forEach(b => {
+    b.onclick = e => { e.stopPropagation(); previewArtifact(+b.dataset.preview); };
+  });
+  $('#artifactBoard').querySelectorAll('.art-src').forEach(l => {
+    l.onclick = e => e.stopPropagation();
+  });
+  $('#artifactBoard').querySelectorAll('.idea-card[data-id]').forEach(card => {
+    const a = ARTIFACTS.find(x => x.id === +card.dataset.id);
+    if (a && a.kind === 'file' && a.exists) {  // file:// 下点击会提示走 serve（needServe 守卫）
+      card.style.cursor = 'pointer';
+      card.onclick = () => previewArtifact(a.id);
+    }
+  });
+}
+
+async function packArtifacts(ids) {
+  if (needServe()) return;
+  try {
+    const r = await fetch('/api/pack', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids})});
+    const j = await r.json();
+    alert(j.ok
+      ? `已复制 ${j.copied} 个文件到 ${j.dir}${j.skipped ? `（${j.skipped} 个跳过：文件已不存在）` : ''}`
+      : `打包失败：${j.error}`);
+  } catch (e) { alert('打包失败：' + e); }
+}
+
+async function patchArtifactPath(id) {
+  if (needServe()) return;
+  const a = ARTIFACTS.find(x => x.id === id);
+  const p = prompt(`「${a ? a.name : ''}」被移动后的新绝对路径：`);
+  if (!p || !p.trim()) return;
+  try {
+    const r = await fetch('/api/artifact/path', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, path: p.trim()})});
+    const j = await r.json();
+    if (j.ok) {
+      a.exists = true; a.moved = true; a.display_path = j.display_path;
+      renderArtifacts();
+    } else alert(j.error || '补路径失败');
+  } catch (e) { alert('补路径失败：' + e); }
+}
+$('#artFilter').oninput = () => renderArtifacts();
+document.querySelectorAll('#artTypeBar input').forEach(c => {
+  c.onchange = () => renderArtifacts();
+});
+
+// ——— 产物预览（仅 serve 模式）：markdown 本地渲染，html/图片/pdf/视频走 iframe ———
+function miniMarkdown(src) {
+  // 极简渲染器：标题/代码块/行内代码/粗斜体/链接/列表/引用，预览够用，不引依赖
+  const escH = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const inline = s => escH(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\*([^*]+)\*/g, '<i>$1</i>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$1" target="_blank" rel="noopener">$2</a>');
+  const blocks = [];
+  let inCode = false, list = null;
+  for (const line of src.split('\n')) {
+    if (/^```/.test(line)) {
+      blocks.push(inCode ? '</code></pre>' : '<pre><code>');
+      inCode = !inCode; list = null; continue;
+    }
+    if (inCode) { blocks.push(escH(line) + '\n'); continue; }
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)/))) {
+      list = null;
+      blocks.push(`<h${m[1].length + 1}>${inline(m[2])}</h${m[1].length + 1}>`);
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)/))) {
+      if (list !== 'ul') { blocks.push('<ul>'); list = 'ul'; }
+      blocks.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+[.、]\s*(.*)/))) {
+      if (list !== 'ol') { blocks.push('<ol>'); list = 'ol'; }
+      blocks.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^>\s?(.*)/))) {
+      list = null;
+      blocks.push(`<blockquote>${inline(m[1])}</blockquote>`);
+    } else if (line.trim() === '') {
+      if (list) { blocks.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; }
+    } else {
+      if (list) { blocks.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; }
+      blocks.push(`<p>${inline(line)}</p>`);
+    }
+  }
+  if (list) blocks.push(list === 'ul' ? '</ul>' : '</ol>');
+  if (inCode) blocks.push('</code></pre>');
+  return blocks.join('');
+}
+
+function ensurePreviewModal() {
+  let m = $('#previewModal');
+  if (m) return m;
+  m = document.createElement('div');
+  m.id = 'previewModal';
+  m.className = 'preview-modal';
+  m.innerHTML = `
+    <div class="preview-box">
+      <div class="preview-head">
+        <span class="preview-title" id="previewTitle"></span>
+        <button class="preview-close" id="previewClose">✕ 关闭</button>
+      </div>
+      <div class="preview-body" id="previewBody"></div>
+    </div>`;
+  document.body.appendChild(m);
+  const close = () => { m.style.display = 'none'; $('#previewBody').innerHTML = ''; };
+  $('#previewClose').onclick = close;
+  m.onclick = e => { if (e.target === m) close(); };
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  return m;
+}
+
+// ——— 深度页 modal（用户决策：不再跳转单独页面）———
+// 全局捕获阶段拦截 a[href^="deep/"]：capture 先于卡片上的 stopPropagation，
+// 会话卡「深度 →」、想法出处链接、产物挂名链接全部生效；cmd/ctrl 点击保留原行为
+function openDeepModal(url) {
+  let m = $('#deepModal');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'deepModal';
+    m.className = 'preview-modal';
+    m.innerHTML = `
+      <div class="preview-box">
+        <div class="preview-head">
+          <span class="preview-title">会话深度分析</span>
+          <span style="display:flex;gap:10px;align-items:center">
+            <a class="art-src" id="deepOpenRaw" href="#" target="_blank" rel="noopener">新窗口打开 ↗</a>
+            <button class="preview-close" id="deepClose">✕ 关闭</button>
+          </span>
+        </div>
+        <div class="preview-body" style="padding:0">
+          <iframe class="preview-frame" id="deepFrame" style="border:none"></iframe>
+        </div>
+      </div>`;
+    document.body.appendChild(m);
+    const close = () => { m.style.display = 'none'; $('#deepFrame').src = 'about:blank'; };
+    m.querySelector('#deepClose').onclick = close;
+    m.onclick = e => { if (e.target === m) close(); };
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && m.style.display !== 'none') close();
+    });
+  }
+  $('#deepFrame').src = url;
+  $('#deepOpenRaw').href = url;
+  m.style.display = 'block';
+}
+document.addEventListener('click', e => {
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+  const a = e.target.closest && e.target.closest('a[href^="deep/"]');
+  if (!a) return;
+  e.preventDefault();
+  openDeepModal(a.getAttribute('href'));
+}, true);
+
+async function previewArtifact(id) {
+  if (needServe()) return;
+  const a = ARTIFACTS.find(x => x.id === id);
+  if (!a || !a.exists) return;
+  const m = ensurePreviewModal();
+  $('#previewTitle').textContent = a.name;
+  const body = $('#previewBody');
+  body.innerHTML = '<div style="color:var(--ink-dim);font-size:13px">加载中…</div>';
+  m.style.display = 'block';  // 不能设 ''：那只会落回 .preview-modal 的 display:none（踩过）
+  const ext = (a.name.match(/\.([^.]+)$/) || ['', ''])[1].toLowerCase();
+  const url = `/api/artifact/raw?id=${id}`;
+  try {
+    if (['md', 'markdown', 'txt'].includes(ext)) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      body.innerHTML = `<div class="md">${miniMarkdown(await r.text())}</div>`;
+    } else {
+      // html/svg/图片/pdf/视频：浏览器原生渲染；serve 侧已加 CSP sandbox 隔离
+      body.innerHTML = `<iframe class="preview-frame" sandbox="allow-scripts" src="${url}"></iframe>`;
+    }
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--ink-dim);font-size:13px">预览失败：${esc(String(e))}</div>`;
+  }
+}
 
 // 异常检测（确定性规则，不依赖 LLM）
 function detectAnomalies() {
@@ -483,11 +718,29 @@ function renderDay() {
   };
 
   const q = $('#sessFilter').value || '';
-  const filtered = ordered.filter(s => sessionMatches(s, q));
-  renderCards($('#sessions'), filtered);
+  let filtered = ordered.filter(s => sessionMatches(s, q));
+  // 视图切换：当日所有（当天活跃过，含更早创建）/ 当日创建（started_at 落在当天）
+  if ($('#sessView').value === 'created')
+    filtered = filtered.filter(s => (s.started_at || '').slice(0, 10) === d.date);
+  // 全局搜索：跨所有日期；非空时盖过当日列表（用户决策：日报 tab 的总搜索入口）
+  const gq = ($('#sessGlobalFilter').value || '').trim();
+  if (gq) {
+    const hits = [];
+    for (const dd of DATA)
+      for (const s of dd.sessions)
+        if (sessionMatches(s, gq)) hits.push({ ...s, _date: dd.date, _showDate: true });
+    hits.sort((a, b) => b._date.localeCompare(a._date) || importance(b) - importance(a));
+    $('#sessGlobalHint').textContent = `全局结果 ${hits.length} 条 · 按日期倒序（清空全局搜索返回当日列表）`;
+    renderCards($('#sessions'), hits);
+  } else {
+    $('#sessGlobalHint').textContent = '';
+    renderCards($('#sessions'), filtered);
+  }
   if (!$('#sessFilter').dataset.bound) {  // 无条件绑定：否则空筛选时首次渲染后输入无反应
     $('#sessFilter').dataset.bound = '1';
     $('#sessFilter').oninput = () => renderDay();  // 输入即重筛当前天
+    $('#sessView').onchange = () => renderDay();
+    $('#sessGlobalFilter').oninput = () => renderDay();
   }
 }
 
@@ -517,7 +770,7 @@ function renderCards(container, list) {
       <div class="src">${esc(x.source)}</div>
       <div class="t">${esc(x.title || '(无标题)')}</div>
       ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
-      <div class="meta"><span>${(x.started_at || '').slice(11, 16)}</span><span>${x.n_user_msgs} 条消息</span></div>
+      <div class="meta"><span>${x._showDate ? (x.started_at || '').slice(5, 16).replace('T', ' ') : timeLabel(x)}</span><span>${x.n_user_msgs} 条消息</span></div>
       <a class="deep" href="deep/${page}.html">深度 →</a>
     </div>`;
   }).join('');
@@ -529,6 +782,12 @@ function renderCards(container, list) {
   });
 }
 
+// 卡片时间：创建日不同于所在视图日时带日期前缀（跨日会话一眼可辨，不再误以为按创建日归类）
+function timeLabel(x) {
+  const st = x.started_at || '';
+  const day = x._date || (DATA[current] && DATA[current].date);
+  return (st && day && st.slice(0, 10) !== day) ? st.slice(5, 16).replace('T', ' ') : st.slice(11, 16);
+}
 // 重要程度打分：有实质交互和 LLM 卡的在前；skipped 和一眼 chore 的沉底
 function importance(s) {
   if (s.digest_status === 'skipped') return -100 + s.n_user_msgs;
@@ -545,3 +804,8 @@ $('#footer').innerHTML =
   `lifelog 生成于 ${esc(BUILT_AT.slice(0, 16).replace('T', ' '))} · 统计数字为代码确定性计算 · ` +
   `会话卡与日叙事由 LLM（k3）生成、按水位缓存 · 数据全部留在本机`;
 renderDay();
+
+// hash 恢复放在最后：switchTab 依赖的 const（ARTIFACTS 等）必须都已初始化，
+// 否则带 #hash 刷新时 TDZ 报错会中断整个脚本（产物列表空白的根因）
+const _hashTab = (location.hash || '').slice(1);
+if (['ideas', 'promises', 'projects', 'artifacts'].includes(_hashTab)) switchTab(_hashTab);

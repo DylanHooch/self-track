@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Iterator
 
-from .base import Adapter, Msg, RawSession, extract_user_query, iter_jsonl, looks_like_noise
+from .base import Adapter, Msg, RawSession, extract_user_query, iter_jsonl, looks_like_noise, note_tool_call
 
 
 class WorkbuddyAdapter(Adapter):
@@ -85,4 +85,6 @@ class WorkbuddyAdapter(Adapter):
                     rs.messages.append(Msg("assistant", text, ts))
             elif otype == "function_call":
                 rs.tool_call_ts.append(ts)
+                note_tool_call(rs, obj.get("name"),
+                               obj.get("arguments") or obj.get("args"))
         return self._finish(rs)

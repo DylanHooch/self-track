@@ -130,6 +130,43 @@ def compute_projects(db: DB) -> list[dict]:
     return out
 
 
+def compute_artifacts(db: DB) -> list[dict]:
+    """产物账本投影：文件/commit + 挂名会话 + 构建时点的存在性探测。
+
+    用户决策：文件被删 → 保留名字与简介，不再展示路径；被移动 → 用用户补的
+    path_override 探测与展示（标 moved）。
+    """
+    rows = db.conn.execute(
+        """SELECT a.id, a.kind, a.name, a.path, a.repo, a.first_day, a.last_day,
+                  a.note, a.head, a.path_override,
+                  s.source AS s_source, s.session_id AS s_sid, s.title AS s_title
+           FROM artifacts a
+           JOIN artifact_sessions l ON l.artifact_id = a.id
+           JOIN sessions s ON s.source = l.source AND s.session_id = l.session_id
+           ORDER BY a.last_day DESC, a.first_day DESC, a.id DESC"""
+    ).fetchall()
+    by_id: dict[int, dict] = {}
+    for r in rows:
+        a = by_id.setdefault(r["id"], {
+            "id": r["id"], "kind": r["kind"], "name": r["name"],
+            "repo": r["repo"], "first_day": r["first_day"], "last_day": r["last_day"],
+            "note": r["note"], "head": r["head"], "sessions": [],
+            "_raw_path": r["path"], "_override": r["path_override"],
+        })
+        a["sessions"].append({"source": r["s_source"], "session_id": r["s_sid"],
+                              "title": r["s_title"]})
+    out = []
+    for a in by_id.values():
+        raw, override = a.pop("_raw_path"), a.pop("_override")
+        if a["kind"] == "file":
+            eff = override or raw
+            a["exists"] = bool(eff) and Path(eff).is_file()
+            a["moved"] = bool(override) and a["exists"]
+            a["display_path"] = eff if a["exists"] else None
+        out.append(a)
+    return out
+
+
 def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) -> Path:
     daily_dir = stats_dir / "daily"
     days = sorted(p.stem for p in daily_dir.glob("*.json"))[-max_days:]
@@ -151,8 +188,17 @@ def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) 
     from .deepdive import render_all_pages
     render_all_pages(db, web_dir)
     payload = {"days": payload_days, "projects": compute_projects(db),
+               "artifacts": compute_artifacts(db),
                "built_at": __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")}
     html = TEMPLATE.replace("/*__DATA__*/", _safe_inline_json(payload))
+    # 静态资源 cache-busting：发版后浏览器可能还抱着旧 app.js 不放（踩过：
+    # 旧 serve 无 no-cache 头时 Chrome 启发式缓存）。?v=mtime 让 URL 随内容变。
+    # SimpleHTTPRequestHandler.translate_path 会丢弃 query，本地服务不受影响。
+    for rel in ("style.css", "app.js", "scene3d.js", "sprite-walker.js"):
+        f = web_dir / rel
+        if f.exists():
+            html = html.replace(f'src="{rel}"', f'src="{rel}?v={int(f.stat().st_mtime)}"')
+            html = html.replace(f'href="{rel}"', f'href="{rel}?v={int(f.stat().st_mtime)}"')
     out = web_dir / "index.html"
     atomic_write_text(out, html)
     return out
@@ -201,6 +247,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <button data-tab="ideas">想法看板</button>
   <button data-tab="projects">项目</button>
   <button data-tab="promises">承诺</button>
+  <button data-tab="artifacts">产物</button>
 </div>
 
 <div id="view-daily">
@@ -215,7 +262,15 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <section>
   <h2>会话 <span style="font-weight:400;color:var(--ink-dim);font-size:12px">点击卡片复制 resume 指令 · 点「深度」看单会话分析</span></h2>
-  <input class="filter" id="sessFilter" placeholder="筛选：标题 / cwd（支持 ~）/ 来源…">
+  <input class="filter" id="sessGlobalFilter" placeholder="全局搜索：跨所有日期的会话（标题 / cwd / 来源）…">
+  <div id="sessGlobalHint" style="font-size:12px;color:var(--ink-dim);margin:-6px 0 10px"></div>
+  <div class="sess-bar">
+    <input class="filter" id="sessFilter" placeholder="筛选当日：标题 / cwd（支持 ~）/ 来源…">
+    <select class="viewsel" id="sessView">
+      <option value="all">当日所有（活跃过）</option>
+      <option value="created">当日创建</option>
+    </select>
+  </div>
   <div class="sess" id="sessions"></div>
 </section>
 </div><!-- /view-daily -->
@@ -243,6 +298,20 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <div id="view-projects" style="display:none">
   <div class="idea-grid" id="projectBoard" style="margin-top:20px"></div>
+</div>
+
+<div id="view-artifacts" style="display:none">
+  <div class="art-type-bar" id="artTypeBar">
+    显示：
+    <label><input type="checkbox" data-art-type="doc" checked> 文档</label>
+    <label><input type="checkbox" data-art-type="img" checked> 图片</label>
+    <label><input type="checkbox" data-art-type="video" checked> 视频</label>
+    <label><input type="checkbox" data-art-type="commit"> commit</label>
+  </div>
+  <input class="filter" id="artFilter" placeholder="筛选产物：文件名 / 路径 / 简介…">
+  <div id="artHint" style="font-size:12px;color:var(--ink-dim);margin-bottom:10px;display:none">
+    打包与补路径需要通过本地应用访问（selftrack 命令起的 :8791），file:// 直开时只读。</div>
+  <div class="idea-grid" id="artifactBoard"></div>
 </div>
 
 <div class="footer" id="footer"></div>

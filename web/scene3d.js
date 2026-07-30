@@ -453,8 +453,10 @@
       var idx = pickAt(e.clientX, e.clientY);
       if (idx >= 0 && opts.onPick) opts.onPick(idx);
     });
-    // 滚轮缩放（略微）：阻止页面滚动
+    // 滚轮缩放（略微）：视角已最远（zoomFactor 上限 1.4）后继续向下滚则放行给
+    // 页面滚动（用户决策），其余情况阻止页面滚动
     renderer.domElement.addEventListener('wheel', function (e) {
+      if (e.deltaY > 0 && zoomFactor >= 1.4 - 1e-6) return;  // 不 preventDefault → 页面下滚
       e.preventDefault();
       zoomFactor *= Math.exp(e.deltaY * 0.0009);
       clampView();

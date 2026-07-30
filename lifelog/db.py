@@ -9,6 +9,51 @@ from pathlib import Path
 # L1/L2 schema 版本：prompt 或字段结构变化时 +1，旧版 done 卡自动转 pending 重算
 DIGEST_SCHEMA_VERSION = 4
 
+# 产物文件白名单（用户决策）：只要文档/图片/视频，代码文件不入账；
+# html 明确要（worktree 分析报告是核心场景）
+_ARTIFACT_DOC_EXT = {
+    ".md", ".markdown", ".txt", ".rtf", ".pdf",
+    ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv",
+    ".pages", ".numbers", ".key",
+    ".html", ".htm",
+}
+_ARTIFACT_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+                     ".heic", ".bmp", ".tiff", ".tif"}
+_ARTIFACT_VIDEO_EXT = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
+ARTIFACT_FILE_EXT = _ARTIFACT_DOC_EXT | _ARTIFACT_IMG_EXT | _ARTIFACT_VIDEO_EXT
+
+# 可读出头两行的文本类扩展（pdf/office 二进制读不了，跳过）
+_HEAD_READABLE_EXT = {".md", ".markdown", ".txt", ".csv", ".html", ".htm"}
+
+
+def head_lines(path: str) -> str | None:
+    """产物头两行外显（用户决策：不然不知道是什么东西）。
+
+    md/txt/csv 取前两行非空文本（剥 markdown 标记）；html 优先 <title>，
+    否则首个去标签文本行。只读前 8KB，失败返回 None。
+    """
+    import re
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(8192)
+    except OSError:
+        return None
+    if Path(path).suffix.lower() in (".html", ".htm"):
+        m = re.search(r"<title[^>]*>(.*?)</title>", raw, re.S | re.I)
+        if m and m.group(1).strip():
+            return re.sub(r"\s+", " ", m.group(1).strip())[:140]
+        text = re.sub(r"<[^>]+>", "\n", raw)
+        lines = [t.strip() for t in text.split("\n") if t.strip()]
+        return " / ".join(lines[:2])[:140] or None
+    lines = []
+    for line in raw.split("\n"):
+        t = re.sub(r"^[#>\s*\-]+", "", line).strip()
+        if t:
+            lines.append(t)
+        if len(lines) >= 2:
+            break
+    return " / ".join(lines[:2])[:140] or None
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
   source           TEXT NOT NULL,
@@ -68,6 +113,31 @@ CREATE TABLE IF NOT EXISTS dirty_days (
   day TEXT PRIMARY KEY
 );
 
+-- 产物账本（用户决策：产物导向，追踪会话写过的文件与 commit，防 worktree 中间产物散落）
+CREATE TABLE IF NOT EXISTS artifacts (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT NOT NULL,          -- 'file' | 'commit'
+  path          TEXT,                   -- file: 绝对路径（去重键）；commit: NULL
+  name          TEXT NOT NULL,          -- 文件名 / commit 摘要
+  repo          TEXT,                   -- commit 的仓库目录
+  first_day     TEXT NOT NULL,
+  last_day      TEXT NOT NULL,
+  note          TEXT,                   -- 简介（LLM 后补，先空）
+  head          TEXT,                   -- 头两行外显（确定性提取，插入时一次性）
+  path_override TEXT                    -- 用户在前端补的移动后路径
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_file
+  ON artifacts(path) WHERE kind='file';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_commit
+  ON artifacts(repo, name, first_day) WHERE kind='commit';
+-- 挂名制：一个产物可被多个会话写过（用户决策：所有写过的都挂名）
+CREATE TABLE IF NOT EXISTS artifact_sessions (
+  artifact_id INTEGER NOT NULL,
+  source      TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  PRIMARY KEY (artifact_id, source, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS scan_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at  TEXT NOT NULL,
@@ -113,6 +183,9 @@ class DB:
                           ("digest_ver", "INTEGER")]:
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+        acols = {r["name"] for r in self.conn.execute("PRAGMA table_info(artifacts)")}
+        if acols and "head" not in acols:
+            self.conn.execute("ALTER TABLE artifacts ADD COLUMN head TEXT")
 
     def close(self):
         self.conn.close()
@@ -141,12 +214,10 @@ class DB:
         # skipped 也只在内容未变时保留；prompt/schema 升级后旧卡自动转 pending 重算）
         digest_status, digest_json, digest_mtime, digest_size = "pending", None, None, None
         digest_ver = None
-        content_changed = old is None
         if old:
             unchanged = (old["digest_mtime"] is not None
                          and rs.raw_mtime <= old["digest_mtime"]
                          and rs.raw_size == old["digest_size"])
-            content_changed = not unchanged
             if unchanged and old["digest_status"] in ("done", "skipped") \
                     and old["digest_ver"] == DIGEST_SCHEMA_VERSION:
                 digest_status = old["digest_status"]
@@ -163,12 +234,10 @@ class DB:
         new_days = {d["day"] for d in day_stats}
         c.executemany("INSERT OR IGNORE INTO dirty_days (day) VALUES (?)",
                       [(d,) for d in old_days | new_days])
-        if content_changed:
-            # L2 叙事随输入集合变化失效（review P0）：任何新增/变更 session 都使
-            # 覆盖日期的日报失效，同事务删除，digest 阶段重新生成；
-            # 宁可暂时没有叙事，也不展示与统计矛盾的陈旧叙事
-            c.executemany("DELETE FROM daily_reports WHERE date=?",
-                          [(d,) for d in old_days | new_days])
+        # 叙事稳定性（用户决策，替代 review P0 的失效删除）：已生成的日叙事不再随
+        # 会话内容变化而作废。沉淀标准 = 叙事生成日期晚于叙事所指日期（即最后总结
+        # 发生在当天 23:59 之后）；当天生成的叙事不算沉淀，digest 阶段允许重算，
+        # 无叙事的日期由 missing_days 补齐逻辑生成。
         c.execute(
             """INSERT OR REPLACE INTO sessions
                (source, session_id, project, cwd, title, started_at, ended_at, active_date,
@@ -192,7 +261,53 @@ class DB:
             [(d["source"], d["session_id"], d["day"], d["n_user"], d["n_assistant"],
               d["n_tool_calls"], json.dumps(sorted(d["hours"]))) for d in day_stats],
         )
+        self._upsert_artifacts(c, rs, sorted(new_days) or [started[:10]])
         # commit 由外层 upsert_session 统一负责
+
+    def _upsert_artifacts(self, c, rs, days_sorted: list[str]):
+        """产物账本：文件写入 + commit。幂等：先摘本会话旧挂名再重建；
+        note/path_override 是人工/LLM 增补，重建时保留。"""
+        from pathlib import Path as _P
+        c.execute("DELETE FROM artifact_sessions WHERE source=? AND session_id=?",
+                  (rs.source, rs.session_id))
+        first_day, last_day = days_sorted[0], days_sorted[-1]
+        for p in sorted(set(rs.file_writes)):
+            if not p.startswith("/"):
+                continue  # adapter 层已按 cwd 归一，兜一层防御
+            if _P(p).suffix.lower() not in ARTIFACT_FILE_EXT:
+                continue  # 白名单：只收文档/图片/视频（用户决策，代码文件不入账）
+            if _P(p).name.lower() == "skill.md" or "/memory/" in p:
+                continue  # 用户决策：skill 定义与 agent 记忆不算交付产物
+            head = head_lines(p) if _P(p).suffix.lower() in _HEAD_READABLE_EXT else None
+            c.execute(
+                """INSERT INTO artifacts (kind, path, name, first_day, last_day, head)
+                   VALUES ('file', ?, ?, ?, ?, ?)
+                   ON CONFLICT(path) WHERE kind='file'
+                   DO UPDATE SET last_day=MAX(last_day, excluded.last_day),
+                                 first_day=MIN(first_day, excluded.first_day),
+                                 head=COALESCE(artifacts.head, excluded.head)""",
+                (p, _P(p).name, first_day, last_day, head))
+            aid = c.execute("SELECT id FROM artifacts WHERE kind='file' AND path=?",
+                            (p,)).fetchone()["id"]
+            c.execute("INSERT OR IGNORE INTO artifact_sessions VALUES (?,?,?)",
+                      (aid, rs.source, rs.session_id))
+        for cm in rs.commits:
+            subject = (cm.get("subject") or "").strip()
+            if not subject:
+                continue  # 拿不到摘要的 commit 没有辨识度，不记
+            repo = cm.get("repo") or rs.cwd or ""
+            c.execute(
+                """INSERT INTO artifacts (kind, name, repo, first_day, last_day)
+                   VALUES ('commit', ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
+                (subject, repo, first_day, last_day))
+            aid = c.execute(
+                "SELECT id FROM artifacts WHERE kind='commit' AND repo=? AND name=? AND first_day=?",
+                (repo, subject, first_day)).fetchone()["id"]
+            c.execute("INSERT OR IGNORE INTO artifact_sessions VALUES (?,?,?)",
+                      (aid, rs.source, rs.session_id))
+        # 孤儿清理：所有挂名都被摘掉的产物（重解析后不再被任何会话写过）
+        c.execute("DELETE FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM artifact_sessions)")
 
     def begin_run(self) -> int:
         cur = self.conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (now_iso(),))

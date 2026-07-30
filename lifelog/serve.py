@@ -99,7 +99,58 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "state": _dispatch_status(label)})
             return
+        if self.path.startswith("/api/artifact/raw"):
+            self._get_artifact_raw()
+            return
         super().do_GET()
+
+    # 预览用内容类型（file:// 打开不了本地文件，预览只能走 serve）
+    _RAW_CONTENT_TYPES = {
+        ".md": "text/plain; charset=utf-8", ".markdown": "text/plain; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8", ".csv": "text/plain; charset=utf-8",
+        ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+        ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+        ".pdf": "application/pdf",
+        ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    }
+
+    def _get_artifact_raw(self):
+        """按产物 id 流式返回文件内容。只放行 artifacts 表登记的路径（含用户补的
+        path_override），不存在任意路径读取面。"""
+        from urllib.parse import parse_qs, urlparse
+        try:
+            aid = int(parse_qs(urlparse(self.path).query).get("id", [""])[0])
+        except ValueError:
+            self._json(400, {"ok": False, "error": "bad id"})
+            return
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            r = db.conn.execute(
+                "SELECT path, path_override FROM artifacts WHERE id=? AND kind='file'",
+                (aid,)).fetchone()
+        finally:
+            db.close()
+        src = (r["path_override"] or r["path"]) if r else None
+        p = Path(src) if src else None
+        if not p or not p.is_file():
+            self._json(404, {"ok": False, "error": "文件已不存在"})
+            return
+        ctype = self._RAW_CONTENT_TYPES.get(p.suffix.lower(),
+                                            "application/octet-stream")
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            self._json(500, {"ok": False, "error": str(e)[:200]})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # 预览 html 产物：允许脚本（报告常有内联图表），但 iframe sandbox 不含
+        # allow-same-origin，父页与本服务均不可达
+        self.send_header("Content-Security-Policy", "sandbox allow-scripts")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _origin_ok(self) -> bool:
         """只接受本机来源：Host 必须是本服务，Origin 缺失（同源 fetch）或本机。
@@ -112,21 +163,133 @@ class Handler(SimpleHTTPRequestHandler):
             return True
         return origin in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
 
-    def do_POST(self):
-        if self.path != "/api/deep-dive":
-            self._json(404, {"ok": False, "error": "unknown endpoint"})
-            return
-        if not self._origin_ok():
-            self._json(403, {"ok": False, "error": "forbidden origin"})
-            return
+    def _read_json(self) -> dict | None:
+        """校验 Content-Type/长度并解析 JSON body；不合法时响应 None 已回 4xx。"""
         if "application/json" not in self.headers.get("Content-Type", ""):
             self._json(415, {"ok": False, "error": "Content-Type must be application/json"})
-            return
+            return None
         try:
             length = int(self.headers.get("Content-Length", 0))
             if not 0 < length <= MAX_BODY:
                 raise ValueError("bad length")
-            body = json.loads(self.rfile.read(length))
+            return json.loads(self.rfile.read(length))
+        except Exception:
+            self._json(400, {"ok": False, "error": "bad request"})
+            return None
+
+    def do_POST(self):
+        if not self._origin_ok():
+            self._json(403, {"ok": False, "error": "forbidden origin"})
+            return
+        if self.path == "/api/deep-dive":
+            self._post_deep_dive()
+        elif self.path == "/api/artifact/path":
+            self._post_artifact_path()
+        elif self.path == "/api/pack":
+            self._post_pack()
+        else:
+            self._json(404, {"ok": False, "error": "unknown endpoint"})
+
+    def _post_artifact_path(self):
+        """用户补录产物被移动后的新路径（产物一般是用户自己移的，他知道在哪）。"""
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            aid = int(body["id"])
+            path = str(body["path"]).strip()
+            assert path.startswith("/") and len(path) <= 500
+        except (KeyError, ValueError, TypeError, AssertionError):
+            self._json(400, {"ok": False, "error": "bad request"})
+            return
+        if not Path(path).is_file():
+            self._json(400, {"ok": False, "error": f"路径不存在或不是文件：{path}"})
+            return
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            cur = db.conn.execute(
+                "UPDATE artifacts SET path_override=? WHERE id=? AND kind='file'", (path, aid))
+            db.conn.commit()
+            if cur.rowcount == 0:
+                self._json(404, {"ok": False, "error": "找不到该文件产物"})
+                return
+        finally:
+            db.close()
+        self._json(200, {"ok": True, "display_path": path})
+
+    def _post_pack(self):
+        """一键打包：把产物的当前内容复制到 ~/Deliverables/<时间戳>/ + manifest.json。
+        复制语义，原文件不动（用户决策）；commit 类无文件可拷，只进 manifest。"""
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            ids = [int(x) for x in body["ids"]][:500]
+            assert ids
+        except (KeyError, ValueError, TypeError, AssertionError):
+            self._json(400, {"ok": False, "error": "bad request"})
+            return
+        import shutil
+        from datetime import datetime
+        out_dir = Path.home() / "Deliverables" / datetime.now().strftime("%Y%m%d-%H%M%S")
+        manifest, copied, skipped = [], 0, 0
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            for aid in ids:
+                r = db.conn.execute(
+                    "SELECT kind, name, path, path_override, repo, first_day, last_day, note "
+                    "FROM artifacts WHERE id=?", (aid,)).fetchone()
+                if not r:
+                    continue
+                entry = {"id": aid, "kind": r["kind"], "name": r["name"],
+                         "first_day": r["first_day"], "last_day": r["last_day"],
+                         "note": r["note"]}
+                if r["kind"] == "commit":
+                    entry["repo"] = r["repo"]
+                    manifest.append(entry)
+                    continue
+                src = r["path_override"] or r["path"]
+                entry["original_path"] = r["path"]
+                if not src or not Path(src).is_file():
+                    entry["skipped"] = "文件已不存在"
+                    manifest.append(entry)
+                    skipped += 1
+                    continue
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dest = out_dir / Path(src).name
+                if dest.exists():
+                    dest = out_dir / f"{aid}-{Path(src).name}"
+                shutil.copy2(src, dest)
+                entry["copied_as"] = dest.name
+                manifest.append(entry)
+                copied += 1
+            # 挂名会话进 manifest（产物的背景）
+            links = db.conn.execute(
+                f"""SELECT l.artifact_id, s.source, s.session_id, s.title
+                    FROM artifact_sessions l
+                    JOIN sessions s ON s.source=l.source AND s.session_id=l.session_id
+                    WHERE l.artifact_id IN ({','.join('?' * len(ids))})""", ids).fetchall()
+            by_aid = {}
+            for l in links:
+                by_aid.setdefault(l["artifact_id"], []).append(
+                    {"source": l["source"], "session_id": l["session_id"], "title": l["title"]})
+            for entry in manifest:
+                entry["sessions"] = by_aid.get(entry["id"], [])
+        finally:
+            db.close()
+        if copied or manifest:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "manifest.json").write_text(
+                json.dumps({"packed_at": datetime.now().isoformat(timespec="seconds"),
+                            "items": manifest}, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied, "skipped": skipped})
+
+    def _post_deep_dive(self):
+        body = self._read_json()
+        if body is None:
+            return
+        try:
             source, sid = str(body["source"])[:64], str(body["session_id"])[:128]
         except Exception:
             self._json(400, {"ok": False, "error": "bad request"})

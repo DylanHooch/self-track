@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise
+from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call
 
 
 def _parse_iso(ts: str) -> Optional[float]:
@@ -20,11 +20,11 @@ def _parse_iso(ts: str) -> Optional[float]:
         return None
 
 
-def _text_from_content(content) -> tuple[str, int]:
-    """返回 (text, n_tool_use)。只提取真实文本块。"""
+def _text_from_content(content) -> tuple[str, int, list]:
+    """返回 (text, n_tool_use, tool_calls)。tool_calls = [(name, input)]，产物账本用。"""
     if isinstance(content, str):
-        return content, 0
-    texts, n_tools = [], 0
+        return content, 0, []
+    texts, n_tools, tool_calls = [], 0, []
     if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict):
@@ -34,7 +34,8 @@ def _text_from_content(content) -> tuple[str, int]:
                 texts.append(block.get("text", ""))
             elif btype == "tool_use":
                 n_tools += 1
-    return "\n".join(t for t in texts if t), n_tools
+                tool_calls.append((block.get("name"), block.get("input")))
+    return "\n".join(t for t in texts if t), n_tools, tool_calls
 
 
 class ClaudeLikeAdapter(Adapter):
@@ -78,8 +79,10 @@ class ClaudeLikeAdapter(Adapter):
             if obj.get("isSidechain"):
                 continue  # 子 agent 侧链不单算，避免重复计数（MVP 决策）
             msg = obj.get("message") or {}
-            text, n_tools = _text_from_content(msg.get("content"))
+            text, n_tools, tool_calls = _text_from_content(msg.get("content"))
             rs.tool_call_ts.extend([ts] * n_tools)
+            for tname, tinput in tool_calls:
+                note_tool_call(rs, tname, tinput)
             if otype == "user":
                 uuid = obj.get("uuid")
                 if not text or looks_like_noise(text):

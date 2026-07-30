@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise
+from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call
 
 _TOOL_ITEM_TYPES = {"function_call", "local_shell_call", "custom_tool_call", "web_search_call"}
 
@@ -80,6 +80,8 @@ class TcodexAdapter(Adapter):
                             rs.messages.append(Msg("assistant", text, ts))
                 elif ptype in _TOOL_ITEM_TYPES:
                     rs.tool_call_ts.append(ts)
+                    note_tool_call(rs, payload.get("name"),
+                                   payload.get("arguments") or payload.get("action"))
             elif otype == "event_msg" and payload.get("type") == "token_count":
                 info = (payload.get("info") or {}).get("total_token_usage") or {}
                 if info:

@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -80,27 +81,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class KimiCodeOAuthBackend:
     """复用 ~/.kimi-code/credentials/kimi-code.json 的 OAuth access_token。
 
-    注意：token 短时有效（约 1 小时），由 kimi CLI 在使用时刷新；本 backend 不做
-    refresh（refresh 端点未公开）。过期时调用方降级为 warning，统计流程不受影响。
+    token 短时有效（约 1 小时），长跑批处理会中途过期。refresh 端点未公开，
+    因此临期/401 时借 `kimi -p ok` 让 CLI 刷新凭证文件后重读（与 selftrack-run
+    别名的预热同一机制）。
     """
 
     name = "kimi-code"
     BASE = "https://api.kimi.com/coding/v1"
+    CRED_PATH = Path.home() / ".kimi-code" / "credentials" / "kimi-code.json"
 
     def __init__(self):
-        cred = json.loads((Path.home() / ".kimi-code" / "credentials" / "kimi-code.json")
-                          .read_text(encoding="utf-8"))
+        cred = json.loads(self.CRED_PATH.read_text(encoding="utf-8"))
         if cred.get("expires_at", 0) < time.time():
             raise RuntimeError("kimi-code OAuth token 已过期，请先运行一次 kimi 刷新")
         self.token = cred["access_token"]
         self.opener = urllib.request.build_opener(_NoRedirect)
 
-    def complete(self, prompt: str) -> str:
-        body = json.dumps({
-            "model": L1_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            # 该端点只允许 temperature=1（实测 400），不传使用默认
-        }).encode()
+    def _read_cred(self) -> dict:
+        return json.loads(self.CRED_PATH.read_text(encoding="utf-8"))
+
+    def _refresh_via_cli(self):
+        """借 kimi CLI 触发 token 刷新（CLI 使用时会自动续期凭证文件）。"""
+        import subprocess
+        r = subprocess.run(["kimi", "-p", "ok"], input="ok",
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"kimi CLI 刷新 token 失败: {(r.stderr or r.stdout)[-200:]}")
+
+    def _request(self, body: bytes) -> str:
         req = urllib.request.Request(
             f"{self.BASE}/chat/completions", data=body,
             headers={"Content-Type": "application/json",
@@ -115,6 +123,31 @@ class KimiCodeOAuthBackend:
         print(f"      └─ LLM({L1_MODEL}) 本次：输入 {n_in:,} / 输出 {n_out:,} token",
               file=sys.stderr)
         return data["choices"][0]["message"]["content"]
+
+    def complete(self, prompt: str) -> str:
+        # 临期（<5min）先主动刷新，避免长跑中途 401
+        try:
+            cred = self._read_cred()
+            if cred.get("expires_at", 0) < time.time() + 300:
+                self._refresh_via_cli()
+                cred = self._read_cred()
+            self.token = cred["access_token"]
+        except OSError:
+            pass  # 凭证文件读不了就用内存里的 token 试，失败走下面 401 路径
+        body = json.dumps({
+            "model": L1_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            # 该端点只允许 temperature=1（实测 400），不传使用默认
+        }).encode()
+        try:
+            return self._request(body)
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+        # 401：让 CLI 刷新后重读 token，重试一次
+        self._refresh_via_cli()
+        self.token = self._read_cred()["access_token"]
+        return self._request(body)
 
 
 def get_backend():
@@ -309,11 +342,15 @@ def run_digest(db: DB) -> set[str]:
         else:
             llm_rows.append((i, r))
 
-    # 补齐：有 done 卡但还没有日叙事的日期（上次运行中途被杀也能续上）
+    # 补齐：有 done 卡但还没有日叙事的日期（上次运行中途被杀也能续上），
+    # 以及叙事是「当天生成」的日期——当天叙事不算沉淀（用户决策：只有次日及以后
+    # 生成的叙事才稳定），当天续跑的会话要靠重算纳入叙事
     missing = db.conn.execute(
         """SELECT DISTINCT d.day AS day FROM session_day_stats d
            JOIN sessions s ON s.source=d.source AND s.session_id=d.session_id
-           WHERE s.digest_status='done' AND d.day NOT IN (SELECT date FROM daily_reports)"""
+           LEFT JOIN daily_reports r ON r.date = d.day
+           WHERE s.digest_status='done'
+             AND (r.date IS NULL OR substr(r.generated_at, 1, 10) <= d.day)"""
     ).fetchall()
     missing_days = {r["day"] for r in missing}
 
@@ -365,6 +402,11 @@ def run_digest(db: DB) -> set[str]:
 
 
 def _run_daily_narratives(db: DB, backend, days: set[str]):
+    # 叙事稳定性（用户决策）：次日及以后生成的叙事视为沉淀，绝不重算/覆盖；
+    # 无叙事或叙事为当天生成（未沉淀）的日期才（重）算
+    settled = {r["date"] for r in db.conn.execute(
+        "SELECT date FROM daily_reports WHERE substr(generated_at, 1, 10) > date")}
+    days = {d for d in days if d not in settled}
     days_sorted = sorted(days)
     n_days = len(days_sorted)
     for di, day in enumerate(days_sorted, 1):
