@@ -351,18 +351,43 @@ class Handler(SimpleHTTPRequestHandler):
             if page.is_file():
                 shutil.copy2(page, out_dir / "session.html")
                 page_file = "session.html"
+            # 原会话记录（复制语义）：jsonl 源拷单文件；kimi-code 是目录，拷
+            # state.json + agents/main/wire.jsonl（与 adapter 解析范围一致）
+            raw_files = []
+            try:
+                # Path() 挪进 try：raw_path 混入 NUL 等坏值时 ValueError 也有兜底（review P2）
+                raw = Path(row["raw_path"]) if row["raw_path"] else None
+                if raw and raw.is_file():
+                    dst = out_dir / "raw" / raw.name
+                    dst.parent.mkdir(exist_ok=True)
+                    shutil.copy2(raw, dst)
+                    raw_files.append(raw.name)
+                elif raw and raw.is_dir():
+                    for rel in ("state.json", "agents/main/wire.jsonl"):
+                        src = raw / rel
+                        if src.is_file():
+                            dst = out_dir / "raw" / rel
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src, dst)
+                            raw_files.append(rel)
+                elif raw:
+                    print(f"  warning: 原会话已不在磁盘: {raw}", file=sys.stderr)
+            except (OSError, ValueError) as e:
+                print(f"  warning: 打包原会话失败: {e}", file=sys.stderr)
             items, copied, skipped = _copy_artifacts(db, ids, out_dir)
             (out_dir / "manifest.json").write_text(
                 json.dumps({"packed_at": datetime.now().isoformat(timespec="seconds"),
                             "session": {"source": source, "session_id": sid,
                                         "title": row["title"], "cwd": row["cwd"],
                                         "started_at": row["started_at"],
-                                        "page_file": page_file},
+                                        "page_file": page_file,
+                                        "raw_files": raw_files},
                             "items": items}, ensure_ascii=False, indent=1),
                 encoding="utf-8")
         finally:
             db.close()
-        self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied, "skipped": skipped})
+        self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied,
+                         "skipped": skipped, "raw_files": raw_files})
 
     def _post_deep_dive(self):
         body = self._read_json()
