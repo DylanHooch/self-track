@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 from .adapters import all_adapters
+from .aggregate import day_rhythm
 from .db import DB, DIGEST_SCHEMA_VERSION, now_iso, to_day
 
 _LLM_CALLS = [0, 0, 0]  # [次数, 输入token, 输出token]
@@ -58,7 +59,9 @@ L2_PROMPT = """你是个人数据追踪助手。下面是某天用户与多个 A
  "commitments": [{"text": "...", "refs": ["source:session_id", ...]}]
 }
 evidence/refs 必须原样引用输入卡片里的 ref 字段。
+若当天作息含熬夜/通宵/早起，请在 summary 里自然地提到（一两笔带过，不要生硬罗列）。
 日期：{day}
+当天作息（程序确定性统计，可信；late_until 为次日凌晨时间）：{rhythm}
 <<CARDS>>
 {cards}
 <<END>>"""
@@ -424,8 +427,20 @@ def _run_daily_narratives(db: DB, backend, days: set[str]):
             cards.append({"ref": f"{r['source']}:{r['session_id']}",
                           "title": r["title"], "card": card})
         valid_refs = {c["ref"] for c in cards}
+        rh = day_rhythm(db.conn, day)
+        bits = []
+        if rh["first"]:
+            bits = [f"{rh['first']} 开始", f"{rh['last']} 结束"]
+            if "通宵" in rh["tags"]:
+                bits.append(f"通宵到次日 {rh['late_until']}")
+            elif "熬夜" in rh["tags"]:
+                bits.append(f"熬夜到次日 {rh['late_until']}")
+            if "早起" in rh["tags"]:
+                bits.append("早起")
+        rh_text = "；".join(bits) if bits else "无数据"
         try:
-            prompt = L2_PROMPT.replace("{day}", day).replace("{cards}", json.dumps(cards, ensure_ascii=False))
+            prompt = (L2_PROMPT.replace("{day}", day).replace("{rhythm}", rh_text)
+                      .replace("{cards}", json.dumps(cards, ensure_ascii=False)))
             out = backend.complete(prompt)
             report = _validate_report(_extract_json(out), valid_refs)
             # 日报与 dirty 标记同一事务（review P1：崩溃窗口丢信号）

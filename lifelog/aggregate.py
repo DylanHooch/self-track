@@ -23,6 +23,81 @@ def atomic_write_text(path: Path, text: str):
     os.replace(tmp_name, path)
 
 
+def day_rhythm(c: sqlite3.Connection, day: str) -> dict:
+    """当天作息信号（确定性计算，零 token；digest 层的日叙事也复用）。
+
+    - first/last：当天最早/最晚活动时刻（"HH:MM"）。会话区间 [started, ended]
+      裁剪到当天、再用该会话当天的真实活跃小时（session_day_stats.hours）收紧，
+      防止「几天前开启、ended_at 缺失」的会话把 first 顶到 00:00。
+    - late_until：次日凌晨 [00:00,04:00) 有活动 → 记在当天头上（「昨晚熬夜」），
+      值=该凌晨活动最晚延续到的时刻（按 <6 点的最大活跃小时 +1h 封顶，防空洞误判）；≥04:30 视为「通宵」。
+    - tags：熬夜 / 通宵 / 早起。早起 = first ∈ [04:00,07:00)；first <04:00 属于
+      前一夜的延续，已由前一天的「熬夜」认领，当天不重复标。
+    假定本地时区无 DST（review P2-5；有夏令时的时区跨天边界会偏 1h）。
+    """
+    from datetime import datetime, timedelta
+
+    day0 = datetime.fromisoformat(day + "T00:00:00").astimezone()
+
+    def _parse(ts):
+        try:
+            return datetime.fromisoformat(ts).astimezone()
+        except (ValueError, TypeError):
+            return None
+
+    def _intervals(d0: datetime) -> list:
+        """返回 [(lo, hi, hours)]：会话区间裁剪到当天，并用当天真实活跃小时收紧两端。"""
+        rows = c.execute(
+            "SELECT s.started_at, s.ended_at, t.hours FROM sessions s "
+            "JOIN session_day_stats t ON s.source=t.source AND s.session_id=t.session_id "
+            "WHERE t.day=?", (d0.strftime("%Y-%m-%d"),)).fetchall()
+        out = []
+        for r in rows:
+            t0 = _parse(r["started_at"])
+            if not t0:
+                continue
+            try:
+                hours = [h for h in json.loads(r["hours"]) if isinstance(h, int) and 0 <= h <= 23]
+            except (ValueError, TypeError):
+                hours = []
+            if not hours:
+                continue  # hours 为空/损坏：跳过该行，不合成虚假活跃时刻（review P2-4）
+            h_lo = d0 + timedelta(hours=min(hours))
+            h_hi = d0 + timedelta(hours=max(hours) + 1)
+            # ended_at 缺失（进行中/崩溃）：回退到当天最大活跃小时+1h，否则 hi 塌缩
+            # 到 t0，跨天进行中会话永远判不出熬夜/通宵（review P2-3）
+            t1 = _parse(r["ended_at"]) or h_hi
+            lo = min(max(t0, h_lo), h_hi)
+            hi = max(min(t1, h_hi), lo)
+            out.append((lo, hi, hours))
+        return out
+
+    iv = _intervals(day0)
+    if not iv:
+        return {"first": None, "last": None, "late_until": None, "tags": []}
+    day1 = day0 + timedelta(days=1)
+    hm_last = lambda t: "24:00" if t >= day1 else t.strftime("%H:%M")  # last 不会越出当天
+    first, last = min(lo for lo, _, _ in iv), max(hi for _, hi, _ in iv)
+    tags: list[str] = []
+    late_until = None
+    # 熬夜：次日凌晨核心窗 [00:00,04:00) 有真实活跃小时才成立；尾部时刻按
+    # 「<6 点的最大活跃小时 +1h」封顶——长会话中间有 idle 空洞（如 hours=[0,8,9]）
+    # 时不能用会话 ended_at，否则把次日早上的活动误算成熬夜延续
+    tails = []
+    for lo, hi, hours in _intervals(day1):
+        if not any(h < 4 for h in hours):
+            continue
+        cap = day1 + timedelta(hours=max(h for h in hours if h < 6) + 1)
+        tails.append(min(hi, cap))
+    if tails:
+        late_until = max(tails)
+        tags.append("通宵" if late_until >= day1 + timedelta(hours=4, minutes=30) else "熬夜")
+    if day0 + timedelta(hours=4) <= first < day0 + timedelta(hours=7):
+        tags.append("早起")
+    return {"first": first.strftime("%H:%M"), "last": hm_last(last),
+            "late_until": late_until.strftime("%H:%M") if late_until else None, "tags": tags}
+
+
 def compute_daily(db: DB, day: str) -> dict:
     c = db.conn
     rows = c.execute(
@@ -67,6 +142,7 @@ def compute_daily(db: DB, day: str) -> dict:
     return {
         "date": day,
         "generated_at": now_iso(),
+        "rhythm": day_rhythm(c, day),
         "stats": {
             "n_sessions": len(rows),
             "by_source": dict(by_source),

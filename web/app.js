@@ -686,6 +686,17 @@ function renderDay() {
     html += `<div class="callout"><span class="t">⚠ 异常</span> ${esc(a)}</div>`;
   if (n.summary) html += `<div class="summary">${esc(n.summary)}</div>`;
   else html += `<div class="none">这一天还没有叙事（未配置 LLM 或会话过少）。下面是硬统计。</div>`;
+  // 作息（程序确定性统计，与 LLM 叙事独立，老日期也有）
+  const rh = d.rhythm || {};
+  if (rh.first) {
+    const tags = (rh.tags || []).map(t => {
+      if (t === '熬夜') return `<span class="rh-tag night">🌙 熬夜到次日 ${esc(rh.late_until || '')}</span>`;
+      if (t === '通宵') return `<span class="rh-tag night">🌙 通宵到次日 ${esc(rh.late_until || '')}</span>`;
+      if (t === '早起') return `<span class="rh-tag early">🌅 早起 ${esc(rh.first)}</span>`;
+      return '';
+    }).join('');
+    html += `<div class="rhythm">${tags}<span class="rh-span">${esc(rh.first)} – ${esc(rh.last)}</span></div>`;
+  }
   const s = d.stats;
   html += `<div class="chips">
     <span class="chip">${s.n_sessions} 个会话</span>
