@@ -155,6 +155,7 @@ h2 { font-size:15px; font-weight:600; margin-bottom:12px; letter-spacing:1px; }
 .badge.open, .badge.haunting { border-color:var(--accent); color:var(--accent); }
 .badge.haunting { background:var(--accent); color:#fff; }
 .badge.landed, .badge.followed { border-color:var(--ok); color:var(--ok); }
+.badge.packed { border-color:var(--accent-soft); color:var(--accent); }
 .badge.pending { border-color:var(--accent); color:var(--accent); }
 .promise-item { display:flex; align-items:baseline; gap:10px; padding:10px 2px;
   border-top:1px solid var(--line); font-size:13px; line-height:1.7; }

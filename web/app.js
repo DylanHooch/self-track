@@ -367,7 +367,9 @@ function needServe() { if (!ON_SERVE) alert(NEED_SERVE_MSG); return !ON_SERVE; }
 
 function artifactBadge(a) {
   if (a.kind === 'commit') return '<span class="badge">commit</span>';
-  if (!a.exists) return '<span class="badge pending">已消失</span>';
+  if (!a.exists) return (a.packed_in && a.packed_in.length)
+    ? '<span class="badge packed">已打包</span>'   // 原件被删但打包副本还在（用户决策）
+    : '<span class="badge pending">已消失</span>';
   if (a.moved) return '<span class="badge followed">已移动</span>';
   return '<span class="badge followed">在</span>';
 }
@@ -398,7 +400,8 @@ function renderArtifacts() {
       ${artifactBadge(a)}
       <div class="title">${esc(a.name)}</div>
       ${a.note || a.head ? `<div class="t">${esc(a.note || a.head)}</div>` : ''}
-      ${a.display_path ? `<div class="cwd">${esc(a.display_path)}</div>` : ''}
+      ${a.display_path ? `<div class="cwd">${esc(a.display_path)}</div>`
+        : (a.packed_in && a.packed_in.length ? `<div class="cwd">副本在 ${esc(a.packed_in.join('、'))}</div>` : '')}
       <div class="m">${a.first_day.slice(5)}${a.last_day !== a.first_day ? ' → ' + a.last_day.slice(5) : ''} · ${a.sessions.length} 个会话${a.kind === 'commit' && a.repo ? ' · ' + esc(a.repo) : ''}</div>
       <div class="art-actions">
         ${a.kind === 'file' && a.exists ? `<button data-preview="${a.id}">预览</button>` : ''}
@@ -438,6 +441,7 @@ async function packArtifacts(ids) {
     const j = await r.json();
     alert(j.ok
       ? `已复制 ${j.copied} 个文件到 ${j.dir}${j.skipped ? `（${j.skipped} 个跳过：文件已不存在）` : ''}`
+        + `\n「已打包」徽章在下次 selftrack-run 构建后更新。`
       : `打包失败：${j.error}`);
   } catch (e) { alert('打包失败：' + e); }
 }

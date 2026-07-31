@@ -130,7 +130,7 @@ def compute_projects(db: DB) -> list[dict]:
     return out
 
 
-def compute_artifacts(db: DB) -> list[dict]:
+def compute_artifacts(db: DB, packed: dict[int, list[str]] | None = None) -> list[dict]:
     """产物账本投影：文件/commit + 挂名会话 + 构建时点的存在性探测。
 
     用户决策：文件被删 → 保留名字与简介，不再展示路径；被移动 → 用用户补的
@@ -156,6 +156,9 @@ def compute_artifacts(db: DB) -> list[dict]:
         a["sessions"].append({"source": r["s_source"], "session_id": r["s_sid"],
                               "title": r["s_title"]})
     out = []
+    if packed is None:
+        from .deepdive import packed_index
+        packed = packed_index()  # 原文件被删但打包过的，状态改判「已打包」（用户决策）
     for a in by_id.values():
         raw, override = a.pop("_raw_path"), a.pop("_override")
         if a["kind"] == "file":
@@ -163,6 +166,7 @@ def compute_artifacts(db: DB) -> list[dict]:
             a["exists"] = bool(eff) and Path(eff).is_file()
             a["moved"] = bool(override) and a["exists"]
             a["display_path"] = eff if a["exists"] else None
+            a["packed_in"] = packed.get(a["id"], [])
         out.append(a)
     return out
 
@@ -185,10 +189,11 @@ def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) 
         print(f"[build-web] 警告：{web_dir} 缺静态依赖：{', '.join(missing)}", file=sys.stderr)
     # 深度页：为全部 session 重建（未分析=stub 页，已分析=完整页带陈旧标记）。
     # 页面是 manifest/DB 的投影，可整体重建；分析本身只在用户点「首次/增量分析」时发生。
-    from .deepdive import render_all_pages
-    render_all_pages(db, web_dir)
+    from .deepdive import packed_index, render_all_pages
+    packed = packed_index()  # 深度页与产物投影共享同一份打包索引（review P2）
+    render_all_pages(db, web_dir, packed)
     payload = {"days": payload_days, "projects": compute_projects(db),
-               "artifacts": compute_artifacts(db),
+               "artifacts": compute_artifacts(db, packed),
                "built_at": __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")}
     html = TEMPLATE.replace("/*__DATA__*/", _safe_inline_json(payload))
     # 静态资源 cache-busting：发版后浏览器可能还抱着旧 app.js 不放（踩过：

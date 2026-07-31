@@ -58,9 +58,46 @@ def safe_page_key(source: str, session_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", f"{source}-{session_id}")
 
 
-def session_artifacts(db: DB, source: str, session_id: str) -> list[dict]:
+def packed_index(deliverables: Path | None = None) -> dict[int, list[str]]:
+    """扫 ~/Deliverables/*/manifest.json：artifact id → 仍存在的打包副本（~/Deliverables/<dir> 形式）。
+
+    打包是内容保全的兜底：原文件被删后，产物状态不该只判「已消失」，
+    还要看有没有打包过（用户决策）。以 manifest 的 copied_as + 文件仍在为准，
+    不另建 DB 表——扫描即真相，不怕打包目录被手工挪动后状态漂移。
+    """
+    root = deliverables or (Path.home() / "Deliverables")
+    out: dict[int, list[str]] = {}
+    if not root.is_dir():
+        return out
+    for mf in root.glob("*/manifest.json"):
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):  # 合法 JSON 但结构不对（数组/标量）也跳过（review P1）
+            continue
+        for item in data.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            aid, copied = item.get("id"), item.get("copied_as")
+            # copied_as 必须是 basename：防手工构造的 manifest 用 ../ 指到包外（review P2）
+            if not isinstance(aid, int) or not isinstance(copied, str) \
+                    or not copied or Path(copied).name != copied:
+                continue
+            if (mf.parent / copied).is_file():
+                out.setdefault(aid, []).append(f"~/Deliverables/{mf.parent.name}")
+    for locs in out.values():
+        locs.sort()  # glob 顺序不定，排序保证投影确定性（review P2）
+    return out
+
+
+def session_artifacts(db: DB, source: str, session_id: str,
+                      packed: dict[int, list[str]] | None = None) -> list[dict]:
     """该会话挂名的全部产物（深度页产物区用）。存在性/moved 探测口径与
-    web.compute_artifacts 一致：override 优先，被删只留名字。"""
+    web.compute_artifacts 一致：override 优先，被删只留名字；packed=打包索引
+    （None 时现算，批量渲染请传入共享索引避免重复扫盘）。"""
+    if packed is None:
+        packed = packed_index()
     rows = db.conn.execute(
         """SELECT a.id, a.kind, a.name, a.path, a.repo, a.first_day, a.last_day,
                   a.note, a.head, a.path_override
@@ -76,6 +113,7 @@ def session_artifacts(db: DB, source: str, session_id: str) -> list[dict]:
             eff = a["path_override"] or a["path"]
             a["exists"] = bool(eff) and Path(eff).is_file()
             a["moved"] = bool(a["path_override"]) and a["exists"]
+            a["packed_in"] = packed.get(a["id"], [])
         out.append(a)
     return out
 
@@ -200,6 +238,8 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
             badge = "<span class='abadge ok'>已移动</span>"
         elif a.get("exists"):
             badge = "<span class='abadge ok'>在</span>"
+        elif a.get("packed_in"):
+            badge = "<span class='abadge packed'>已打包</span>"
         else:
             badge = "<span class='abadge gone'>已消失</span>"
         note = a.get("note") or a.get("head") or ""
@@ -208,6 +248,10 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
             meta += " → " + a["last_day"][5:]
         if a["kind"] == "commit" and a.get("repo"):
             meta += " · " + _esc(a["repo"])
+        if not a.get("exists") and a.get("packed_in"):
+            locs = a["packed_in"]
+            more = f" 等 {len(locs)} 处" if len(locs) > 2 else ""
+            meta += " · 副本在 " + _esc("、".join(locs[:2]) + more)
         preview = (f"<button class='btn sm' onclick='previewArt({a['id']})'>预览</button>"
                    if a["kind"] == "file" and a.get("exists") else "")
         art_items += (
@@ -308,6 +352,7 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
   .abadge {{ display:inline-block; font-size:10px; border-radius:10px; padding:1px 8px;
             border:1px solid var(--dim); color:var(--dim); margin-right:6px; }}
   .abadge.ok {{ border-color:var(--ok); color:var(--ok); }}
+  .abadge.packed {{ border-color:var(--accent-soft); color:var(--accent); }}
   .abadge.gone {{ border-color:var(--accent); color:var(--accent); }}
   #packForm {{ margin-bottom:12px; }}
   #packForm input {{ border:1px solid var(--line); border-radius:8px; background:#fff;
@@ -643,11 +688,13 @@ def deep_dive(db: DB, source: str, session_id: str, web_dir: Path) -> Path:
                        session_artifacts(db, source, session_id))
 
 
-def render_all_pages(db: DB, web_dir: Path):
+def render_all_pages(db: DB, web_dir: Path, packed: dict[int, list[str]] | None = None):
     """build_web 调用：为全部 session 重建深度页（stub 或完整页，带陈旧标记）。
-    孤儿页（session 已不在库）与孤儿 manifest 条目一并清理。"""
+    孤儿页（session 已不在库）与孤儿 manifest 条目一并清理。
+    packed=打包索引（None 时现算；build_web 与 compute_artifacts 共享一份）。"""
     manifest = load_manifest(web_dir)
     adapters = {a.source: a for a in all_adapters()}
+    packed = packed if packed is not None else packed_index()  # 避免每页重扫 ~/Deliverables
     rows = db.conn.execute("SELECT * FROM sessions").fetchall()
     live_keys = set()
     for row in rows:
@@ -672,7 +719,7 @@ def render_all_pages(db: DB, web_dir: Path):
             if entry and entry.get("analysis"):
                 stale_new = -1  # 源文件不可用/解析失败（与"有新增"区分展示）
         render_page(row, web_dir, entry, stale_new, messages,
-                    session_artifacts(db, row["source"], row["session_id"]))
+                    session_artifacts(db, row["source"], row["session_id"], packed))
     # 清理孤儿
     deep_dir = web_dir / "deep"
     if deep_dir.is_dir():
