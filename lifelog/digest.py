@@ -182,9 +182,12 @@ def should_skip(n_user: int, started: str | None, ended: str | None) -> str | No
 
 
 def build_transcript(messages: list, max_chars: int = 12000) -> str:
-    """首尾采样：预算 2/3 给前半、1/3 给后半，保留结尾（结论常在尾部）。"""
+    """首尾采样：预算 2/3 给前半、1/3 给后半，保留结尾（结论常在尾部）。
+    role='tool' 的消息条不进 transcript（工具噪声白烧 token）。"""
     parts = []
     for m in messages:
+        if m.role not in ("user", "assistant"):
+            continue
         if m.role == "user":
             text = m.text[:2000]
         else:

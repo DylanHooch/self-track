@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Iterator
 
-from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call
+from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call, summarize_tool
 
 
 class KimiCodeAdapter(Adapter):
@@ -102,6 +102,8 @@ class KimiCodeAdapter(Adapter):
                     elif etype == "tool.call":
                         rs.tool_call_ts.append(ts)
                         note_tool_call(rs, ev.get("name"), ev.get("args"))
+                        kind, summary = summarize_tool(ev.get("name"), ev.get("args"))
+                        rs.messages.append(Msg("tool", "", ts, kind, ev.get("name") or "", summary))
                 elif otype == "usage.record":
                     u = obj.get("usage") or {}
                     n_in += u.get("inputOther", 0) + u.get("inputCacheRead", 0) + u.get("inputCacheCreation", 0)

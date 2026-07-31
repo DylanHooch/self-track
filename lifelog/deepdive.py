@@ -58,6 +58,28 @@ def safe_page_key(source: str, session_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", f"{source}-{session_id}")
 
 
+def session_artifacts(db: DB, source: str, session_id: str) -> list[dict]:
+    """该会话挂名的全部产物（深度页产物区用）。存在性/moved 探测口径与
+    web.compute_artifacts 一致：override 优先，被删只留名字。"""
+    rows = db.conn.execute(
+        """SELECT a.id, a.kind, a.name, a.path, a.repo, a.first_day, a.last_day,
+                  a.note, a.head, a.path_override
+           FROM artifacts a
+           JOIN artifact_sessions l ON l.artifact_id = a.id
+           WHERE l.source=? AND l.session_id=?
+           ORDER BY a.last_day DESC, a.first_day DESC, a.id DESC""",
+        (source, session_id)).fetchall()
+    out = []
+    for r in rows:
+        a = dict(r)
+        if a["kind"] == "file":
+            eff = a["path_override"] or a["path"]
+            a["exists"] = bool(eff) and Path(eff).is_file()
+            a["moved"] = bool(a["path_override"]) and a["exists"]
+        out.append(a)
+    return out
+
+
 def _validate_analysis(a: dict) -> dict:
     """深度分析输出校验：不信任模型结构（review 修正）。"""
     if not isinstance(a, dict) or not isinstance(a.get("arc"), str) or not a["arc"]:
@@ -92,9 +114,14 @@ def _esc(s) -> str:
 
 def _js_string(s: str) -> str:
     """安全内联进 <script> 的 JS 字符串字面量（review 修正：json.dumps 不防 </script>）。"""
-    return (json.dumps(s, ensure_ascii=False)
+    return _js_data(s)
+
+
+def _js_data(obj) -> str:
+    """安全内联进 <script> 的 JS 数据字面量：转义 < > U+2028 U+2029。"""
+    return (json.dumps(obj, ensure_ascii=False)
             .replace("<", "\\u003c").replace(">", "\\u003e")
-            .replace(" ", "\\u2028").replace(" ", "\\u2029"))
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 def _shq(s: str) -> str:
@@ -102,9 +129,10 @@ def _shq(s: str) -> str:
 
 
 def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
-                messages: list | None = None) -> Path:
+                messages: list | None = None, arts: list | None = None) -> Path:
     """渲染单个深度页（stub 或完整页）。entry=manifest 条目（None=未分析）。
-    stale_new=已分析后新增的消息数。messages=完整消息列表（仅完整页需要）。"""
+    stale_new=已分析后新增的消息数。messages=完整消息列表（解析成功即传，完整对话区用）。
+    arts=该会话挂名的产物（session_artifacts 的输出）。"""
     source, sid = row["source"], row["session_id"]
     try:
         card = json.loads(row["digest_json"]) if row["digest_json"] else None
@@ -151,17 +179,52 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
             + (f"<h3>想法</h3><ul>{ideas_html}</ul>" if ideas else "")
             + (f"<h3>承诺</h3><ul>{''.join(f'<li>{_esc(i)}</li>' for i in card.get('commitments', []))}</ul>" if card.get("commitments") else ""))
 
-    timeline_html = ""
+    # 完整对话：IM 气泡样式，数据内联 JSON（file:// 也能看），前端分批懒渲染
+    chat_html, msgs_json = "", "null"
     if messages:
-        for m in messages:
-            text = m.text if len(m.text) <= 600 else m.text[:600] + " …"
-            ts = ""
-            if m.ts:
-                ts = datetime.fromtimestamp(m.ts).astimezone().strftime("%m-%d %H:%M")
-            timeline_html += (
-                f'<div class="msg {m.role}"><div class="msg-meta">{m.role} · {ts}</div>'
-                f"<div class=\"msg-text\">{_esc(text)}</div></div>")
-        timeline_html = f"<h2>消息时间线</h2><div class='box'>{timeline_html}</div>"
+        msgs_json = _js_data([
+            {"r": m.role, "t": m.text, "k": m.kind, "n": m.name, "s": m.summary,
+             "tm": datetime.fromtimestamp(m.ts).astimezone().strftime("%m-%d %H:%M")
+                   if m.ts else ""}
+            for m in messages])
+        chat_html = (f"<h2>完整对话 <span class='dim' style='font-weight:400;font-size:12px'>"
+                     f"{len(messages)} 条 · 滚动到底自动加载更多</span></h2>"
+                     "<div class='chat' id='chat'></div><div id='chatSentinel'></div>")
+
+    # 产物区：列出会话挂名的全部产物；打包=会话详情页+现存产物文件 → ~/Deliverables/
+    art_items = ""
+    for a in (arts or []):
+        if a["kind"] == "commit":
+            badge = "<span class='abadge'>commit</span>"
+        elif a.get("moved"):
+            badge = "<span class='abadge ok'>已移动</span>"
+        elif a.get("exists"):
+            badge = "<span class='abadge ok'>在</span>"
+        else:
+            badge = "<span class='abadge gone'>已消失</span>"
+        note = a.get("note") or a.get("head") or ""
+        meta = a["first_day"][5:]
+        if a["last_day"] != a["first_day"]:
+            meta += " → " + a["last_day"][5:]
+        if a["kind"] == "commit" and a.get("repo"):
+            meta += " · " + _esc(a["repo"])
+        preview = (f"<button class='btn sm' onclick='previewArt({a['id']})'>预览</button>"
+                   if a["kind"] == "file" and a.get("exists") else "")
+        art_items += (
+            f"<div class='art'>{badge}<span class='an'>{_esc(a['name'])}</span>{preview}"
+            + (f"<div class='anote'>{_esc(note)}</div>" if note else "")
+            + f"<div class='am'>{meta}</div></div>")
+    arts_html = (
+        "<h2>产物 <button class='btn sm' onclick='showPack()'>打包会话+产物</button></h2>"
+        "<div id='packForm' class='box' style='display:none'>"
+        "<div class='dim' style='margin-bottom:8px'>打包到 ~/Deliverables/ 下的一个目录："
+        "会话详情页 + 现存产物文件 + manifest.json（复制语义，原文件不动）。"
+        "目录名留空则用会话标题。</div>"
+        f"<input id='packName' placeholder=\"{_esc(row['title'] or '(无标题)')}\">"
+        "<button class='btn primary sm' id='packGo' onclick='doPack()'>确认打包</button>"
+        "<button class='btn sm' onclick=\"document.getElementById('packForm').style.display='none'\">取消</button></div>"
+        + (f"<div class='box'>{art_items}</div>" if art_items
+           else "<div class='dim'>这个会话还没有登记产物（写过的文档/图片/视频、执行过的 commit 会出现在这里）。</div>"))
 
     page = safe_page_key(source, sid)
     html = f"""<!DOCTYPE html>
@@ -169,7 +232,9 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(row['title'] or sid)} · 深度分析</title>
 <style>
-  :root {{ --ink:#2b2b2b; --dim:#8a8a8a; --line:#e5e1d8; --bg:#faf8f4; --accent:#c96f4a; }}
+  /* 与主站 web/style.css 同套设计 token（暮色灯塔：纸白 + 落日橙） */
+  :root {{ --ink:#22303f; --dim:#67798b; --line:#d3dce4; --bg:#edf1f5; --card:#f8fafc;
+           --accent:#e07b39; --accent-soft:#f2a65a; --ok:#5a8f5a; }}
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body {{ background:var(--bg); color:var(--ink); font-family:-apple-system,"PingFang SC",sans-serif;
          max-width:820px; margin:0 auto; padding:32px 20px 80px; }}
@@ -177,7 +242,8 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
   h2 {{ font-size:15px; margin:28px 0 12px; }}
   h3 {{ font-size:13px; margin:16px 0 8px; color:var(--dim); }}
   .meta {{ color:var(--dim); font-size:12px; margin-top:6px; }}
-  .box {{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }}
+  .box {{ background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:16px 18px; box-shadow:0 1px 3px rgba(34,48,63,.04); }}
   .arc {{ font-size:14px; line-height:1.9; }}
   ul {{ padding-left:20px; font-size:13px; line-height:2; }}
   .chips {{ margin-top:10px; }}
@@ -186,20 +252,68 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
   .kpis {{ display:flex; gap:24px; flex-wrap:wrap; margin-top:16px; }}
   .kpi .n {{ font-size:26px; font-weight:700; }}
   .kpi .l {{ font-size:11px; color:var(--dim); }}
-  .msg {{ border-top:1px solid var(--line); padding:10px 2px; }}
-  .msg-meta {{ font-size:11px; color:var(--dim); }}
-  .msg.user .msg-meta {{ color:var(--accent); }}
-  .msg-text {{ font-size:13px; line-height:1.7; margin-top:4px; white-space:pre-wrap; word-break:break-word; }}
+  .chat {{ margin-top:4px; }}
+  .crow {{ display:flex; margin:10px 0; }}
+  .crow.me {{ justify-content:flex-end; }}
+  .cbub {{ max-width:78%; border-radius:14px; padding:9px 13px; background:var(--card);
+          border:1px solid var(--line); box-shadow:0 1px 3px rgba(34,48,63,.04); }}
+  .crow.ai .cbub {{ border-bottom-left-radius:4px; }}
+  .crow.me .cbub {{ background:rgba(224,123,57,.09); border-color:rgba(242,165,90,.55);
+                   border-bottom-right-radius:4px; }}
+  .cmeta {{ font-size:10px; color:var(--dim); margin-bottom:4px; }}
+  .crow.me .cmeta {{ text-align:right; color:var(--accent); }}
+  .ctext {{ font-size:13px; line-height:1.7; white-space:pre-wrap; word-break:break-word; }}
+  /* 工具调用 / skill：轻量 chip，不用气泡（用户决策：结构化识别，不裸输出） */
+  .crow.tc {{ margin:4px 0; }}
+  .tchip {{ font-size:11px; color:var(--dim); background:var(--card);
+           border:1px dashed var(--line); border-radius:12px; padding:2px 10px;
+           max-width:88%; word-break:break-all; }}
+  .tchip b {{ color:var(--ink); font-weight:600; }}
+  .tchip.skill {{ border-style:solid; border-color:var(--accent-soft); }}
+  .tchip.skill b {{ color:var(--accent); }}
+  /* 气泡内 markdown 渲染（miniMarkdown 已先转义，无注入面） */
+  .ctext.md {{ white-space:normal; }}
+  .ctext.md p {{ margin:4px 0; }}
+  .ctext.md h2, .ctext.md h3, .ctext.md h4, .ctext.md h5 {{ margin:8px 0 4px; font-size:13px; }}
+  .ctext.md ul, .ctext.md ol {{ padding-left:18px; margin:4px 0; }}
+  .ctext.md pre {{ background:var(--bg); border-radius:8px; padding:8px 12px; overflow:auto;
+                  font-size:12px; margin:6px 0; white-space:pre-wrap; word-break:break-word; }}
+  .ctext.md code {{ font-family:ui-monospace,Menlo,monospace; font-size:.92em; }}
+  .ctext.md blockquote {{ border-left:3px solid var(--line); margin:6px 0;
+                         padding:2px 10px; color:var(--dim); }}
+  /* 纯 XML 消息 → 标签：value 行 */
+  .xmlrow {{ display:flex; gap:8px; font-size:12px; padding:3px 0;
+            border-top:1px dashed var(--line); }}
+  .xmlrow:first-child {{ border-top:none; }}
+  .xtag {{ color:var(--accent); font-weight:600; white-space:nowrap; }}
+  .xtag::after {{ content:"："; }}
+  .xval {{ color:var(--ink); white-space:pre-wrap; word-break:break-word; }}
   .dim {{ color:var(--dim); font-size:13px; }}
   .back {{ font-size:12px; color:var(--dim); text-decoration:none; }}
   .footer {{ margin-top:40px; font-size:11px; color:var(--dim); }}
   .scope {{ font-size:11px; color:var(--dim); margin-bottom:10px; }}
-  .stale {{ border-left:3px solid var(--accent); background:#fff; padding:10px 14px;
+  .stale {{ border-left:3px solid var(--accent); background:var(--card); padding:10px 14px;
            border-radius:0 8px 8px 0; font-size:13px; margin-bottom:12px; }}
-  .btn {{ border:1px solid var(--accent); color:var(--accent); background:#fff;
+  .btn {{ border:1px solid var(--accent); color:var(--accent); background:var(--card);
          border-radius:14px; padding:4px 14px; font-size:12px; cursor:pointer; margin-left:8px; }}
+  .btn.sm {{ padding:2px 10px; font-size:11px; }}
   .btn.primary {{ margin-left:0; margin-top:10px; padding:6px 18px; font-size:13px; }}
+  .btn.primary.sm {{ margin-top:0; padding:4px 14px; font-size:12px; }}
   .btn:disabled {{ opacity:.6; cursor:default; border-color:var(--dim); color:var(--dim); }}
+  .art {{ border-top:1px solid var(--line); padding:10px 2px; }}
+  .art:first-child {{ border-top:none; }}
+  .art .an {{ font-size:13px; font-weight:500; }}
+  .art .anote {{ color:var(--dim); font-size:12px; margin-top:3px; line-height:1.6; }}
+  .art .am {{ color:var(--dim); font-size:11px; margin-top:3px; }}
+  .abadge {{ display:inline-block; font-size:10px; border-radius:10px; padding:1px 8px;
+            border:1px solid var(--dim); color:var(--dim); margin-right:6px; }}
+  .abadge.ok {{ border-color:var(--ok); color:var(--ok); }}
+  .abadge.gone {{ border-color:var(--accent); color:var(--accent); }}
+  #packForm {{ margin-bottom:12px; }}
+  #packForm input {{ border:1px solid var(--line); border-radius:8px; background:#fff;
+    padding:6px 10px; font-size:13px; font-family:inherit; color:var(--ink);
+    width:min(420px,60%); margin-right:6px; }}
+  #packForm input:focus {{ outline:none; border-color:var(--accent); }}
   #toast {{ position:fixed; bottom:30px; left:50%; transform:translateX(-50%);
     background:var(--ink); color:#fff; padding:8px 20px; border-radius:20px;
     font-size:13px; opacity:0; transition:opacity .25s; pointer-events:none; }}
@@ -217,11 +331,139 @@ def render_page(row, web_dir: Path, entry: dict | None, stale_new: int,
 {action_html}
 <div class="box">{analysis_html}</div>
 {f'<h2>会话卡</h2><div class="box">{card_html}</div>' if card_html else ''}
-{timeline_html}
+{arts_html}
+{chat_html}
 <div class="footer">由 lifelog deep-dive 生成 · {now_iso()} · 数字为代码确定性计算，分析为 LLM 产出 · 页面可由 manifest 重建</div>
 <div id="toast"></div>
 <script>
 const SRC = {_js_string(source)}, SID = {_js_string(sid)};
+const MSGS = {msgs_json};
+// 完整对话懒渲染：首批 40 条，哨兵进入视口再渲下一批（textContent 赋值，无 HTML 注入面）
+if (MSGS) {{
+  const chat = document.getElementById('chat');
+  const BATCH = 40;
+  let idx = 0;
+  // ——— 结构化渲染 ———
+  const escH = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const miniMarkdown = src => {{
+    const inline = s => escH(s)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+      .replace(/\*([^*]+)\*/g, '<i>$1</i>')
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$1" target="_blank" rel="noopener">$2</a>');
+    const blocks = [];
+    let inCode = false, list = null;
+    for (const line of src.split('\\n')) {{
+      if (/^```/.test(line)) {{
+        blocks.push(inCode ? '</code></pre>' : '<pre><code>');
+        inCode = !inCode; list = null; continue;
+      }}
+      if (inCode) {{ blocks.push(escH(line) + '\\n'); continue; }}
+      let mm;
+      if ((mm = line.match(/^(#{{1,4}})\s+(.*)/))) {{
+        list = null;
+        blocks.push(`<h${{mm[1].length + 1}}>${{inline(mm[2])}}</h${{mm[1].length + 1}}>`);
+      }} else if ((mm = line.match(/^\s*[-*]\s+(.*)/))) {{
+        if (list !== 'ul') {{ blocks.push('<ul>'); list = 'ul'; }}
+        blocks.push(`<li>${{inline(mm[1])}}</li>`);
+      }} else if ((mm = line.match(/^\s*\d+[.、]\s*(.*)/))) {{
+        if (list !== 'ol') {{ blocks.push('<ol>'); list = 'ol'; }}
+        blocks.push(`<li>${{inline(mm[1])}}</li>`);
+      }} else if ((mm = line.match(/^>\s?(.*)/))) {{
+        list = null;
+        blocks.push(`<blockquote>${{inline(mm[1])}}</blockquote>`);
+      }} else if (line.trim() === '') {{
+        if (list) {{ blocks.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; }}
+      }} else {{
+        if (list) {{ blocks.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; }}
+        blocks.push(`<p>${{inline(line)}}</p>`);
+      }}
+    }}
+    if (list) blocks.push(list === 'ul' ? '</ul>' : '</ol>');
+    if (inCode) blocks.push('</code></pre>');
+    return blocks.join('');
+  }};
+  // 整条都是 XML 的消息 → 标签：value 行（DOMParser 校验，不合法就回退 markdown）
+  const xmlToBlocks = text => {{
+    const t = text.trim();
+    if (!/^<[a-zA-Z][\w.-]*(\s|>)/.test(t) || !/<\/[\w.-]+>\s*$/.test(t)) return null;
+    let doc;
+    try {{ doc = new DOMParser().parseFromString(`<x-root>${{t}}</x-root>`, 'text/xml'); }}
+    catch (e) {{ return null; }}
+    if (doc.querySelector('parsererror')) return null;
+    const kids = [...doc.documentElement.children];
+    if (!kids.length) return null;
+    return kids.map(el => ({{ tag: el.tagName, val: (el.textContent || '').trim() }}));
+  }};
+  const renderContent = (body, text) => {{
+    const xb = xmlToBlocks(text);
+    if (xb) {{
+      for (const b of xb) {{
+        const row = document.createElement('div');
+        row.className = 'xmlrow';
+        const tag = document.createElement('span');
+        tag.className = 'xtag';
+        tag.textContent = b.tag;
+        const val = document.createElement('span');
+        val.className = 'xval';
+        val.textContent = b.val;
+        row.appendChild(tag); row.appendChild(val);
+        body.appendChild(row);
+      }}
+      return;
+    }}
+    body.classList.add('md');
+    body.innerHTML = miniMarkdown(text);
+  }};
+  const renderBatch = () => {{
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < BATCH && idx < MSGS.length; i++, idx++) {{
+      const m = MSGS[idx];
+      const row = document.createElement('div');
+      if (m.r === 'tool') {{
+        row.className = 'crow tc';
+        const chip = document.createElement('div');
+        chip.className = 'tchip' + (m.k === 'skill' ? ' skill' : '');
+        const tn = document.createElement('b');
+        tn.textContent = (m.k === 'skill' ? '✨ ' : '⚙ ') + (m.n || 'tool');
+        chip.appendChild(tn);
+        if (m.s) {{
+          const ts = document.createElement('span');
+          ts.className = 'tsum';
+          ts.textContent = ' ' + m.s;
+          chip.appendChild(ts);
+        }}
+        row.appendChild(chip);
+        frag.appendChild(row);
+        continue;
+      }}
+      row.className = 'crow ' + (m.r === 'user' ? 'me' : 'ai');
+      const bub = document.createElement('div');
+      bub.className = 'cbub';
+      const meta = document.createElement('div');
+      meta.className = 'cmeta';
+      meta.textContent = (m.r === 'user' ? '我' : SRC) + (m.tm ? ' · ' + m.tm : '');
+      const body = document.createElement('div');
+      body.className = 'ctext';
+      renderContent(body, m.t);
+      bub.appendChild(meta); bub.appendChild(body);
+      row.appendChild(bub);
+      frag.appendChild(row);
+    }}
+    chat.appendChild(frag);
+  }};
+  renderBatch();
+  if ('IntersectionObserver' in window) {{
+    const io = new IntersectionObserver(es => {{
+      if (!es[0].isIntersecting) return;
+      renderBatch();
+      if (idx >= MSGS.length) io.disconnect();
+    }}, {{ rootMargin: '800px' }});
+    io.observe(document.getElementById('chatSentinel'));
+  }} else {{
+    while (idx < MSGS.length) renderBatch();
+  }}
+}}
 const IS_APP = location.protocol === 'http:';
 if (IS_APP) {{
   const hint = document.getElementById('stubHint');
@@ -284,6 +526,41 @@ function copyCmd() {{
     document.body.removeChild(ta);
   }}
 }}
+const NEED_APP = '需要通过本地应用打开页面：http://127.0.0.1:8791/（file:// 直开只读）';
+function showPack() {{
+  if (!IS_APP) {{ toast(NEED_APP); return; }}
+  document.getElementById('packForm').style.display = 'block';
+  document.getElementById('packName').focus();
+}}
+async function doPack() {{
+  if (!IS_APP) {{ toast(NEED_APP); return; }}
+  const btn = document.getElementById('packGo');
+  btn.disabled = true; btn.textContent = '打包中…';
+  try {{
+    const r = await fetch('/api/pack-session', {{ method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ source: SRC, session_id: SID,
+        name: document.getElementById('packName').value.trim() }}) }});
+    const d = await r.json();
+    if (d.ok) {{
+      document.getElementById('packForm').style.display = 'none';
+      toast(`已打包到 ${{d.dir}}（复制 ${{d.copied}} 个文件${{d.skipped ? `，跳过 ${{d.skipped}} 个` : ''}}）`);
+    }} else toast('打包失败：' + (d.error || r.status));
+  }} catch (e) {{ toast('打包失败：' + e); }}
+  btn.disabled = false; btn.textContent = '确认打包';
+}}
+function previewArt(id) {{
+  if (!IS_APP) {{ toast(NEED_APP); return; }}
+  // 在 modal iframe 里时复用主站预览弹窗（同源）；主站数据过旧找不到 id 时兜底新开标签
+  try {{
+    if (parent !== window && typeof parent.previewArtifact === 'function') {{
+      parent.previewArtifact(id);
+      const pm = parent.document.getElementById('previewModal');
+      if (pm && pm.style.display === 'block') return;
+    }}
+  }} catch (e) {{ /* 跨域等异常走兜底 */ }}
+  window.open('/api/artifact/raw?id=' + id, '_blank');
+}}
 </script>
 </body></html>"""
     out = web_dir / "deep" / f"{page}.html"
@@ -335,7 +612,8 @@ def deep_dive(db: DB, source: str, session_id: str, web_dir: Path) -> Path:
             # 没有新消息：无论元数据水位如何变化都短路（review：kimi state.json
             # 原地重写会骗过 mtime/size，空增量白烧一次 LLM 调用）
             print(f"没有新消息（{n_total} 条），无需重跑")
-            return render_page(row, web_dir, entry, 0, rs.messages)
+            return render_page(row, web_dir, entry, 0, rs.messages,
+                               session_artifacts(db, source, session_id))
 
     if os.environ.get("LIFELOG_LLM_BACKEND", "none") == "none":
         raise SystemExit("需要 LIFELOG_LLM_BACKEND=kimi-code 才能分析（统计页已由 build-web 生成）")
@@ -361,7 +639,8 @@ def deep_dive(db: DB, source: str, session_id: str, web_dir: Path) -> Path:
     manifest[page] = entry
     save_manifest(web_dir, manifest)
     print(f"{'增量' if incremental else '首次'}分析完成（{n_old}→{n_total} 条消息）")
-    return render_page(row, web_dir, entry, 0, rs.messages)
+    return render_page(row, web_dir, entry, 0, rs.messages,
+                       session_artifacts(db, source, session_id))
 
 
 def render_all_pages(db: DB, web_dir: Path):
@@ -383,14 +662,17 @@ def render_all_pages(db: DB, web_dir: Path):
             entry = None
         stale_new = 0
         messages = None
-        if entry and entry.get("analysis"):
-            try:
-                rs = adapters[row["source"]].parse(Path(row["raw_path"]))
-                messages = rs.messages
+        try:
+            # 全量解析：完整对话区对所有会话开放（310 会话 ≈ 1.3s，实测可接受）
+            rs = adapters[row["source"]].parse(Path(row["raw_path"]))
+            messages = rs.messages
+            if entry and entry.get("analysis"):
                 stale_new = max(0, len(rs.messages) - entry.get("n_messages", 0))
-            except Exception:
+        except Exception:
+            if entry and entry.get("analysis"):
                 stale_new = -1  # 源文件不可用/解析失败（与"有新增"区分展示）
-        render_page(row, web_dir, entry, stale_new, messages)
+        render_page(row, web_dir, entry, stale_new, messages,
+                    session_artifacts(db, row["source"], row["session_id"]))
     # 清理孤儿
     deep_dir = web_dir / "deep"
     if deep_dir.is_dir():

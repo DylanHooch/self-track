@@ -15,9 +15,38 @@ from typing import Iterator, Optional
 
 @dataclass
 class Msg:
-    role: str          # 'user' | 'assistant'
+    role: str          # 'user' | 'assistant' | 'tool'
     text: str
     ts: Optional[float] = None   # epoch seconds
+    kind: str = "text"           # 'text' | 'tool' | 'skill'（role='tool' 时细分）
+    name: str = ""               # tool/skill 名
+    summary: str = ""            # 一行结构化摘要（命令/路径/查询词），聊天页 chip 用
+
+
+def summarize_tool(name, args) -> tuple[str, str]:
+    """工具调用 → (kind, summary)。kind='skill'|'tool'；summary 取最有辨识度的
+    一个参数（命令首行/文件路径/匹配模式/查询词…），宽容处理，异常静默。"""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    lname = (name or "").lower()
+    if lname == "skill":
+        return "skill", str(args.get("skill") or args.get("name") or "")
+    for key in ("command", "cmd", "file_path", "path", "pattern",
+                "query", "url", "description", "prompt"):
+        v = args.get(key)
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v)
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if key in ("command", "cmd"):
+                s = s.split("\n", 1)[0]
+            return "tool", s[:140]
+    return "tool", ""
 
 
 # ——— 产物账本抽取（用户决策：产物导向，会话写过什么文件/commit 是确定性事实）———

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call
+from .base import Adapter, Msg, RawSession, iter_jsonl, looks_like_noise, note_tool_call, summarize_tool
 
 
 def _parse_iso(ts: str) -> Optional[float]:
@@ -83,6 +83,8 @@ class ClaudeLikeAdapter(Adapter):
             rs.tool_call_ts.extend([ts] * n_tools)
             for tname, tinput in tool_calls:
                 note_tool_call(rs, tname, tinput)
+                kind, summary = summarize_tool(tname, tinput)
+                rs.messages.append(Msg("tool", "", ts, kind, tname or "", summary))
             if otype == "user":
                 uuid = obj.get("uuid")
                 if not text or looks_like_noise(text):

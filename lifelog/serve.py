@@ -77,6 +77,42 @@ def _start_analysis(source: str, sid: str) -> str:
     return label
 
 
+def _copy_artifacts(db: DB, ids: list, out_dir: Path):
+    """把产物的当前内容复制到 out_dir 并构建 manifest 条目（复制语义，原文件不动；
+    commit 类无文件可拷，只进 manifest）。返回 (items, copied, skipped)。"""
+    import shutil
+    items, copied, skipped = [], 0, 0
+    for aid in ids:
+        r = db.conn.execute(
+            "SELECT kind, name, path, path_override, repo, first_day, last_day, note "
+            "FROM artifacts WHERE id=?", (aid,)).fetchone()
+        if not r:
+            continue
+        entry = {"id": aid, "kind": r["kind"], "name": r["name"],
+                 "first_day": r["first_day"], "last_day": r["last_day"],
+                 "note": r["note"]}
+        if r["kind"] == "commit":
+            entry["repo"] = r["repo"]
+            items.append(entry)
+            continue
+        src = r["path_override"] or r["path"]
+        entry["original_path"] = r["path"]
+        if not src or not Path(src).is_file():
+            entry["skipped"] = "文件已不存在"
+            items.append(entry)
+            skipped += 1
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / Path(src).name
+        if dest.exists():
+            dest = out_dir / f"{aid}-{Path(src).name}"
+        shutil.copy2(src, dest)
+        entry["copied_as"] = dest.name
+        items.append(entry)
+        copied += 1
+    return items, copied, skipped
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB), **kwargs)
@@ -187,6 +223,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._post_artifact_path()
         elif self.path == "/api/pack":
             self._post_pack()
+        elif self.path == "/api/pack-session":
+            self._post_pack_session()
         else:
             self._json(404, {"ok": False, "error": "unknown endpoint"})
 
@@ -218,8 +256,7 @@ class Handler(SimpleHTTPRequestHandler):
         self._json(200, {"ok": True, "display_path": path})
 
     def _post_pack(self):
-        """一键打包：把产物的当前内容复制到 ~/Deliverables/<时间戳>/ + manifest.json。
-        复制语义，原文件不动（用户决策）；commit 类无文件可拷，只进 manifest。"""
+        """一键打包：把产物的当前内容复制到 ~/Deliverables/<时间戳>/ + manifest.json。"""
         body = self._read_json()
         if body is None:
             return
@@ -229,40 +266,11 @@ class Handler(SimpleHTTPRequestHandler):
         except (KeyError, ValueError, TypeError, AssertionError):
             self._json(400, {"ok": False, "error": "bad request"})
             return
-        import shutil
         from datetime import datetime
         out_dir = Path.home() / "Deliverables" / datetime.now().strftime("%Y%m%d-%H%M%S")
-        manifest, copied, skipped = [], 0, 0
         db = DB(DATA / "lifelog.sqlite")
         try:
-            for aid in ids:
-                r = db.conn.execute(
-                    "SELECT kind, name, path, path_override, repo, first_day, last_day, note "
-                    "FROM artifacts WHERE id=?", (aid,)).fetchone()
-                if not r:
-                    continue
-                entry = {"id": aid, "kind": r["kind"], "name": r["name"],
-                         "first_day": r["first_day"], "last_day": r["last_day"],
-                         "note": r["note"]}
-                if r["kind"] == "commit":
-                    entry["repo"] = r["repo"]
-                    manifest.append(entry)
-                    continue
-                src = r["path_override"] or r["path"]
-                entry["original_path"] = r["path"]
-                if not src or not Path(src).is_file():
-                    entry["skipped"] = "文件已不存在"
-                    manifest.append(entry)
-                    skipped += 1
-                    continue
-                out_dir.mkdir(parents=True, exist_ok=True)
-                dest = out_dir / Path(src).name
-                if dest.exists():
-                    dest = out_dir / f"{aid}-{Path(src).name}"
-                shutil.copy2(src, dest)
-                entry["copied_as"] = dest.name
-                manifest.append(entry)
-                copied += 1
+            manifest, copied, skipped = _copy_artifacts(db, ids, out_dir)
             # 挂名会话进 manifest（产物的背景）
             links = db.conn.execute(
                 f"""SELECT l.artifact_id, s.source, s.session_id, s.title
@@ -283,6 +291,77 @@ class Handler(SimpleHTTPRequestHandler):
                 json.dumps({"packed_at": datetime.now().isoformat(timespec="seconds"),
                             "items": manifest}, ensure_ascii=False, indent=1),
                 encoding="utf-8")
+        self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied, "skipped": skipped})
+
+    def _post_pack_session(self):
+        """打包单个会话：会话详情页 + 该会话全部产物 → ~/Deliverables/<目录名>/。
+        目录名取用户输入（可空），默认会话标题；消毒路径分隔/控制符，撞名加 -2/-3。"""
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            source, sid = str(body["source"])[:64], str(body["session_id"])[:128]
+            name = str(body.get("name") or "").strip()[:120]
+        except Exception:
+            self._json(400, {"ok": False, "error": "bad request"})
+            return
+        import shutil
+        from datetime import datetime
+        from .deepdive import safe_page_key
+        from .adapters import all_adapters
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            row = db.conn.execute(
+                "SELECT * FROM sessions WHERE source=? AND session_id=?",
+                (source, sid)).fetchone()
+            if not row:
+                self._json(404, {"ok": False, "error": f"找不到会话 {source}:{sid}"})
+                return
+            ids = [r["artifact_id"] for r in db.conn.execute(
+                "SELECT artifact_id FROM artifact_sessions WHERE source=? AND session_id=?",
+                (source, sid)).fetchall()]
+            base = re.sub(r"[/\\\x00-\x1f]+", "_", name or row["title"] or "").strip(" .")
+            base = base[:80] or safe_page_key(source, sid)
+            root = Path.home() / "Deliverables"
+            out_dir, n = root / base, 2
+            while out_dir.exists():
+                out_dir = root / f"{base}-{n}"
+                n += 1
+            out_dir.mkdir(parents=True)
+            page_file = None
+            page = WEB / "deep" / f"{safe_page_key(source, sid)}.html"
+            # 打包前重渲深度页：磁盘页可能是旧代码/旧数据的投影
+            # （踩过：旧版打出来的 session.html 没有完整对话区）
+            from .deepdive import load_manifest, render_page, session_artifacts
+            entry = load_manifest(WEB).get(safe_page_key(source, sid))
+            if entry and not entry.get("analysis"):
+                entry = None
+            messages, stale = None, 0
+            try:
+                adapter = {a.source: a for a in all_adapters()}[source]
+                rs = adapter.parse(Path(row["raw_path"]))
+                messages = rs.messages
+                if entry:
+                    stale = max(0, len(rs.messages) - entry.get("n_messages", 0))
+            except Exception:
+                if entry:
+                    stale = -1
+            render_page(row, WEB, entry, stale, messages,
+                        session_artifacts(db, source, sid))
+            if page.is_file():
+                shutil.copy2(page, out_dir / "session.html")
+                page_file = "session.html"
+            items, copied, skipped = _copy_artifacts(db, ids, out_dir)
+            (out_dir / "manifest.json").write_text(
+                json.dumps({"packed_at": datetime.now().isoformat(timespec="seconds"),
+                            "session": {"source": source, "session_id": sid,
+                                        "title": row["title"], "cwd": row["cwd"],
+                                        "started_at": row["started_at"],
+                                        "page_file": page_file},
+                            "items": items}, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        finally:
+            db.close()
         self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied, "skipped": skipped})
 
     def _post_deep_dive(self):

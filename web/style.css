@@ -201,9 +201,9 @@ h2 { font-size:15px; font-weight:600; margin-bottom:12px; letter-spacing:1px; }
   margin:20px 0 10px; font-size:12px; color:var(--ink-dim); }
 .art-type-bar label { display:flex; gap:4px; align-items:center; cursor:pointer; }
 /* ——— 产物预览弹窗 ——— */
-.preview-modal { position:fixed; inset:0; background:rgba(30,25,20,.55);
+.preview-modal { position:fixed; inset:0; background:rgba(11,19,32,.55);
   display:none; z-index:100; padding:4vh 4vw; }
-.preview-box { background:var(--bg,#faf8f4); border-radius:12px; max-width:960px;
+.preview-box { background:var(--card); border-radius:12px; max-width:960px;
   margin:0 auto; height:100%; display:flex; flex-direction:column; overflow:hidden; }
 .preview-head { display:flex; justify-content:space-between; align-items:center;
   padding:10px 16px; border-bottom:1px solid var(--line); }
@@ -214,7 +214,7 @@ h2 { font-size:15px; font-weight:600; margin-bottom:12px; letter-spacing:1px; }
 .preview-body { flex:1; overflow:auto; padding:18px 22px; }
 .preview-frame { width:100%; height:100%; border:none; min-height:70vh; background:#fff; }
 .preview-body .md { font-size:14px; line-height:1.8; max-width:760px; }
-.preview-body .md pre { background:#f3efe8; border-radius:8px; padding:10px 14px;
+.preview-body .md pre { background:var(--paper); border-radius:8px; padding:10px 14px;
   overflow:auto; font-size:12px; }
 .preview-body .md code { font-family:ui-monospace,Menlo,monospace; font-size:.92em; }
 .preview-body .md blockquote { border-left:3px solid var(--line); margin:8px 0;

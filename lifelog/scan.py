@@ -36,8 +36,9 @@ def day_stats_of(rs: RawSession) -> list[dict]:
         b = bucket(m.ts)
         if m.role == "user":
             b["n_user"] += 1
-        else:
+        elif m.role == "assistant":
             b["n_assistant"] += 1
+        # role='tool' 的消息条不计入对话统计（工具调用数另有 tool_call_ts）
     for ts in rs.tool_call_ts:
         if ts is not None:
             bucket(ts)["n_tool_calls"] += 1
