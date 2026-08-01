@@ -164,6 +164,7 @@ def compute_daily(db: DB, day: str) -> dict:
                 "n_user_msgs": s["day_user"],      # 当日量，非会话全生命周期
                 "n_tool_calls": s["day_tools"],
                 "digest_status": s["digest_status"],
+                "auto_kind": s["auto_kind"],   # 非交互会话分类，前端收拢分组用
                 "digest": json.loads(s["digest_json"]) if s["digest_json"] else None,
             }
             for s in sessions

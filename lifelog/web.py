@@ -263,7 +263,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div id="liveHint" style="font-size:12px;color:var(--ink-dim);margin-bottom:10px;display:none">
     实时看板需要通过本地应用访问（selftrack 命令起的 :8791），file:// 直开时不可用。</div>
-  <div class="sess" id="liveSessions"></div>
+  <div class="kanban" id="liveKanban"></div>
 </div>
 
 <div id="view-daily">
@@ -288,6 +288,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     </select>
   </div>
   <div class="sess" id="sessions"></div>
+  <div id="autoSessions"></div>
 </section>
 </div><!-- /view-daily -->
 

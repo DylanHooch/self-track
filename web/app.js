@@ -344,6 +344,7 @@ function ideaProjects(it) {
 function switchTab(name) {
   document.querySelectorAll('.tabbar button').forEach(x =>
     x.classList.toggle('on', x.dataset.tab === name));
+  document.body.classList.toggle('wide', name === 'live');  // kanban 多列需要更宽版面
   $('#view-daily').style.display = name === 'daily' ? '' : 'none';
   $('#view-live').style.display = name === 'live' ? '' : 'none';
   $('#view-ideas').style.display = name === 'ideas' ? '' : 'none';
@@ -469,9 +470,12 @@ document.querySelectorAll('#artTypeBar input').forEach(c => {
   c.onchange = () => renderArtifacts();
 });
 
-// ——— 实时看板（仅 serve 模式）：近 8 小时活跃会话。GET 只读库（完整 run 的数据
-// 直接复用）；「刷新」才触发 POST /api/scan-light 纯扫描（无 AI），不自动触发 ———
+// ——— 实时看板（仅 serve 模式）：近 8 小时活跃会话，multica 式分列。
+// 人类会话按活跃度分「进行中 / 近1小时 / 早些时候」三列；机器发起的非交互会话
+// （auto_kind：dispatch 委派 / skill 调用 / 探测）收拢进「自动任务」列，默认折叠
+// （用户决策 2026-08-01）。GET 只读库；「刷新」才触发 POST /api/scan-light ———
 const LIVE_HOURS = 8;
+const AUTO_KIND_CN = {dispatch: '委派', 'skill-auto': 'skill 调用', probe: '探测'};
 function relLabel(iso, nowMs) {
   const t = new Date(iso).getTime();              // ISO 带时区偏移，Date 直接可解
   if (isNaN(t)) return '';
@@ -484,7 +488,7 @@ function relLabel(iso, nowMs) {
 }
 
 async function renderLive() {
-  const box = $('#liveSessions'), meta = $('#liveMeta'), hint = $('#liveHint');
+  const box = $('#liveKanban'), meta = $('#liveMeta'), hint = $('#liveHint');
   if (!ON_SERVE) {
     hint.style.display = '';                       // file:// 直开：说明后留空
     box.innerHTML = '';
@@ -495,7 +499,7 @@ async function renderLive() {
     const r = await fetch(`/api/live-sessions?hours=${LIVE_HOURS}`);
     const j = await r.json();
     if (!j.ok) throw new Error(j.error || '加载失败');
-    renderLiveCards(box, j.sessions, new Date(j.server_now).getTime());
+    renderLiveKanban(box, j.sessions, new Date(j.server_now).getTime());
     if (!meta.dataset.scanned)                     // 没手动扫过：标明数据时点
       meta.textContent = `近 ${LIVE_HOURS} 小时活跃 · ${j.sessions.length} 个会话 · 数据时点 ${j.server_now.slice(11, 19)}（点「刷新」扫描最新）`;
   } catch (e) {
@@ -503,30 +507,65 @@ async function renderLive() {
   }
 }
 
-function renderLiveCards(box, list, nowMs) {
+// 列定义：顺序即展示顺序；auto 列兜底收机器会话，默认 collapsed
+const LIVE_COLS = [
+  {key: 'now',     label: '进行中',   dot: 'green',  test: x => x._mins < 10},
+  {key: 'hour',    label: '近 1 小时', dot: 'orange', test: x => x._mins < 60},
+  {key: 'earlier', label: '早些时候', dot: 'gray',   test: () => true},
+];
+function renderLiveKanban(box, list, nowMs) {
   if (!list.length) {
     box.innerHTML = `<div style="color:var(--ink-dim);font-size:13px">近 ${LIVE_HOURS} 小时没有活跃会话。点「刷新」做一次纯扫描看看最新情况。</div>`;
     return;
   }
-  box.innerHTML = list.map((x, i) => {
-    const page = pageKey(x.source, x.session_id);
-    const ongoing = x.last_active && (nowMs - new Date(x.last_active).getTime()) < 10 * 60000;
+  list.forEach(x => {
+    const t = new Date(x.last_active).getTime();
+    x._mins = isNaN(t) ? 1e9 : Math.max(0, (nowMs - t) / 60000);
+  });
+  const humans = list.filter(x => !x.auto_kind);
+  const autos = list.filter(x => !!x.auto_kind);
+  const cols = LIVE_COLS.map(c => ({...c, items: []}));
+  for (const x of humans) (cols.find(c => c.test(x)) || cols[cols.length - 1]).items.push(x);
+  cols.push({key: 'auto', label: '自动任务', dot: 'purple', items: autos});
+  box.innerHTML = cols.map(c => {
+    const collapsed = c.key === 'auto';            // 自动任务默认不展示（用户决策）
     return `
-    <div class="card" data-i="${i}">
-      <span class="copied">已复制 ✓</span>
-      <div class="src">${esc(x.source)}${ongoing ? ' <span class="badge live-on">进行中</span>' : ''}</div>
-      <div class="t">${esc(x.title || '(无标题)')}</div>
-      ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
-      <div class="meta"><span>${esc(relLabel(x.last_active, nowMs))}</span><span>${x.n_user_msgs} 条消息 · ${x.n_tool_calls} 次工具</span></div>
-      <a class="deep" href="deep/${page}.html">深度 →</a>
+    <div class="kcol${collapsed ? ' collapsed' : ''}" data-col="${c.key}">
+      <div class="kcol-head"><span class="dot ${c.dot}"></span>${c.label}
+        <span class="cnt">${c.items.length}</span>
+        ${c.key === 'auto' ? '<span class="kcol-toggle">展开</span>' : ''}</div>
+      <div class="kcol-body">${c.items.map((x, i) => liveCard(x, i, nowMs)).join('') ||
+        '<div class="kcol-empty">（空）</div>'}</div>
     </div>`;
   }).join('');
-  box.querySelectorAll('.card').forEach(card => {
-    card.onclick = () => copyText(resumeText(list[+card.dataset.i]), card);
+  box.querySelectorAll('.kcol').forEach(colEl => {
+    const key = colEl.dataset.col;
+    const items = cols.find(c => c.key === key).items;
+    colEl.querySelectorAll('.card').forEach(card => {
+      card.onclick = () => copyText(resumeText(items[+card.dataset.i]), card);
+    });
+    colEl.querySelectorAll('a.deep').forEach(el => {
+      el.onclick = e => e.stopPropagation();
+    });
+    if (key === 'auto')
+      colEl.querySelector('.kcol-head').onclick = () => {
+        colEl.classList.toggle('collapsed');
+        colEl.querySelector('.kcol-toggle').textContent =
+          colEl.classList.contains('collapsed') ? '展开' : '收起';
+      };
   });
-  box.querySelectorAll('a.deep').forEach(el => {
-    el.onclick = e => e.stopPropagation();
-  });
+}
+
+function liveCard(x, i, nowMs) {
+  const page = pageKey(x.source, x.session_id);
+  return `
+  <div class="card k" data-i="${i}">
+    <span class="copied">已复制 ✓</span>
+    <div class="k-top"><span class="src-pill sp-${esc(x.source)}">${esc(x.source)}</span>${x.auto_kind ? `<span class="badge auto">${esc(AUTO_KIND_CN[x.auto_kind] || '自动')}</span>` : ''}<span class="k-time">${esc(relLabel(x.last_active, nowMs))}</span></div>
+    <div class="t">${esc(x.title || '(无标题)')}</div>
+    ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
+    <div class="meta"><span>${x.n_user_msgs} 条消息 · ${x.n_tool_calls} 次工具</span><a class="deep" href="deep/${page}.html">深度 →</a></div>
+  </div>`;
 }
 
 $('#liveRefresh').onclick = async () => {
@@ -837,9 +876,12 @@ function renderDay() {
     hits.sort((a, b) => b._date.localeCompare(a._date) || importance(b) - importance(a));
     $('#sessGlobalHint').textContent = `全局结果 ${hits.length} 条 · 按日期倒序（清空全局搜索返回当日列表）`;
     renderCards($('#sessions'), hits);
+    $('#autoSessions').innerHTML = '';  // 搜索是显式查找：自动会话混在结果里（徽章标识），不收拢
   } else {
     $('#sessGlobalHint').textContent = '';
-    renderCards($('#sessions'), filtered);
+    // 机器发起的非交互会话（auto_kind）从主列表剔除，收拢到底部折叠区（用户决策）
+    renderCards($('#sessions'), filtered.filter(s => !s.auto_kind));
+    renderAutoSessions(filtered.filter(s => s.auto_kind));
   }
   if (!$('#sessFilter').dataset.bound) {  // 无条件绑定：否则空筛选时首次渲染后输入无反应
     $('#sessFilter').dataset.bound = '1';
@@ -872,7 +914,7 @@ function renderCards(container, list) {
     return `
     <div class="card${x._imp < 0 ? ' chore' : ''}" data-i="${i}">
       <span class="copied">已复制 ✓</span>
-      <div class="src">${esc(x.source)}</div>
+      <div class="src">${esc(x.source)}${x.auto_kind ? ` <span class="badge auto">${esc(AUTO_KIND_CN[x.auto_kind] || '自动')}</span>` : ''}</div>
       <div class="t">${esc(x.title || '(无标题)')}</div>
       ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
       <div class="meta"><span>${x._showDate ? (x.started_at || '').slice(5, 16).replace('T', ' ') : timeLabel(x)}</span><span>${x.n_user_msgs} 条消息</span></div>
@@ -885,6 +927,21 @@ function renderCards(container, list) {
   container.querySelectorAll('a.deep').forEach(el => {
     el.onclick = e => e.stopPropagation();
   });
+}
+
+// 自动会话收拢（用户决策：日报默认不展示机器发起的会话，折叠条点击展开；
+// 展开状态存在容器 dataset 上，renderDay 重渲染不丢）
+function renderAutoSessions(list) {
+  const wrap = $('#autoSessions');
+  if (!list.length) { wrap.innerHTML = ''; return; }  // 状态保持：不 reset open（review P2 统一）
+  const open = wrap.dataset.open === '1';
+  wrap.innerHTML = `<div class="auto-toggle">🤖 自动任务 ${list.length} 个（机器发起：dispatch 委派 / skill 调用 / 探测）<span class="arr">${open ? '收起 ▴' : '展开 ▾'}</span></div>
+    <div class="auto-body" style="display:${open ? '' : 'none'}"><div class="sess" id="autoSessList"></div></div>`;
+  wrap.querySelector('.auto-toggle').onclick = () => {
+    wrap.dataset.open = open ? '0' : '1';
+    renderDay();
+  };
+  if (open) renderCards($('#autoSessList'), list);
 }
 
 // 卡片时间：创建日不同于所在视图日时带日期前缀（跨日会话一眼可辨，不再误以为按创建日归类）

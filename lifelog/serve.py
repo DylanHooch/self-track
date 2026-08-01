@@ -85,7 +85,8 @@ def _live_sessions(db: DB, hours: float) -> list[dict]:
     cutoff = datetime.now().astimezone() - timedelta(hours=hours)
     rows = db.conn.execute(
         """SELECT source, session_id, title, cwd, project, started_at, ended_at,
-                  n_user_msgs, n_assistant_msgs, n_tool_calls, digest_status, digest_json
+                  n_user_msgs, n_assistant_msgs, n_tool_calls, digest_status, digest_json,
+                  auto_kind
            FROM sessions""").fetchall()
     out = []
     for r in rows:
@@ -103,7 +104,8 @@ def _live_sessions(db: DB, hours: float) -> list[dict]:
                 "started_at": r["started_at"], "ended_at": r["ended_at"],
                 "last_active": last, "_last_dt": last_dt,
                 "n_user_msgs": r["n_user_msgs"], "n_assistant_msgs": r["n_assistant_msgs"],
-                "n_tool_calls": r["n_tool_calls"], "digest_status": r["digest_status"]}
+                "n_tool_calls": r["n_tool_calls"], "digest_status": r["digest_status"],
+                "auto_kind": r["auto_kind"]}
         if r["digest_json"]:
             try:
                 card = json.loads(r["digest_json"])

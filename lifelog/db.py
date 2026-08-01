@@ -2,12 +2,40 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 # L1/L2 schema 版本：prompt 或字段结构变化时 +1，旧版 done 卡自动转 pending 重算
 DIGEST_SCHEMA_VERSION = 4
+
+# ——— 非交互会话识别（用户决策 2026-08-01：机器发起的与人类区分，看板收拢默认不展示）———
+# 判定只依赖已落库字段（first_user_msg / n_user_msgs），不碰原始文件——规则升级后
+# 旧会话靠 upsert 重算或手工回填，无需重解析。
+# - dispatch：agent-dispatch 委派（skill 标准任务模板 "# Task"）
+# - skill-auto：skill 后端非交互启动（image/video 生成的 "You were launched by the ..."）
+# - probe：探测类（token 刷新 "ok"、"Reply with exactly ..."、cron-fire 包装）
+_AUTO_HEAD_RULES = [
+    ("dispatch", re.compile(r"^#\s*(Task\b|任务\b)")),
+    ("skill-auto", re.compile(r"^You were launched by the ")),
+    ("probe", re.compile(r"^(Reply with exactly\b|<cron-fire\b)")),
+]
+
+
+def classify_auto(first_user_msg: str | None, n_user_msgs: int) -> str | None:
+    """返回 auto_kind（None = 人类发起）。模板命中即判（resume 续跑也是机器文本，
+    不看消息数）；短消息探测只认白名单 "ok"（review P1：按长度猜会误伤人类
+    短开场如「你好」「在吗」——藏人比藏机器代价高，宁漏勿错）。"""
+    t = (first_user_msg or "").strip()
+    if not t:
+        return None
+    for kind, pat in _AUTO_HEAD_RULES:
+        if pat.search(t):
+            return kind
+    if n_user_msgs <= 1 and t.lower() == "ok":  # token 刷新：echo ok | kimi -p "ok"
+        return "probe"
+    return None
 
 # 产物文件白名单（用户决策）：只要文档/图片/视频，代码文件不入账；
 # html 明确要（worktree 分析报告是核心场景）
@@ -75,6 +103,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   digest_mtime     REAL,
   digest_size      INTEGER,
   digest_ver       INTEGER,
+  auto_kind        TEXT,                -- 非交互会话分类（classify_auto）；NULL=人类发起
   raw_path         TEXT NOT NULL,
   raw_mtime        REAL NOT NULL,
   raw_size         INTEGER NOT NULL DEFAULT 0,
@@ -183,12 +212,30 @@ class DB:
         for col, decl in [("raw_size", "INTEGER NOT NULL DEFAULT 0"),
                           ("digest_mtime", "REAL"),
                           ("digest_size", "INTEGER"),
-                          ("digest_ver", "INTEGER")]:
+                          ("digest_ver", "INTEGER"),
+                          ("auto_kind", "TEXT")]:
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+                if col == "auto_kind":
+                    self._backfill_auto_kind()
         acols = {r["name"] for r in self.conn.execute("PRAGMA table_info(artifacts)")}
         if acols and "head" not in acols:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN head TEXT")
+
+    def _backfill_auto_kind(self):
+        """老库一次性回填 auto_kind（只读已落库字段，几百行规模，秒级）。"""
+        rows = self.conn.execute(
+            "SELECT source, session_id, first_user_msg, n_user_msgs FROM sessions").fetchall()
+        n = 0
+        for r in rows:
+            kind = classify_auto(r["first_user_msg"], r["n_user_msgs"])
+            if kind:
+                self.conn.execute(
+                    "UPDATE sessions SET auto_kind=? WHERE source=? AND session_id=?",
+                    (kind, r["source"], r["session_id"]))
+                n += 1
+        if n:
+            print(f"[db] 回填非交互会话标记：{n} 个")
 
     def close(self):
         self.conn.close()
@@ -246,13 +293,14 @@ class DB:
                (source, session_id, project, cwd, title, started_at, ended_at, active_date,
                 n_user_msgs, n_assistant_msgs, n_tool_calls, n_input_tokens, n_output_tokens,
                 first_user_msg, digest_status, digest_json, digest_mtime, digest_size, digest_ver,
-                raw_path, raw_mtime, raw_size, processed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                auto_kind, raw_path, raw_mtime, raw_size, processed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rs.source, rs.session_id, rs.project, rs.cwd, rs.title,
              started, to_local_iso(rs.ended_at), to_day(rs.started_at) if rs.started_at else started[:10],
              rs.n_user_msgs, rs.n_assistant_msgs, rs.n_tool_calls,
              rs.n_input_tokens, rs.n_output_tokens, rs.first_user_msg,
              digest_status, digest_json, digest_mtime, digest_size, digest_ver,
+             classify_auto(rs.first_user_msg, rs.n_user_msgs),
              rs.raw_path, rs.raw_mtime, rs.raw_size, now_iso()),
         )
         c.execute("DELETE FROM session_day_stats WHERE source=? AND session_id=?",
