@@ -249,10 +249,21 @@ TEMPLATE = r"""<!DOCTYPE html>
 <main>
 <div class="tabbar">
   <button data-tab="daily" class="on">日报</button>
+  <button data-tab="live">实时</button>
   <button data-tab="ideas">想法看板</button>
   <button data-tab="projects">项目</button>
   <button data-tab="promises">承诺</button>
   <button data-tab="artifacts">产物</button>
+</div>
+
+<div id="view-live" style="display:none">
+  <div class="live-bar">
+    <button class="live-refresh" id="liveRefresh">刷新</button>
+    <span class="live-meta" id="liveMeta">近 8 小时活跃的会话 · 纯扫描，无 AI 整理</span>
+  </div>
+  <div id="liveHint" style="font-size:12px;color:var(--ink-dim);margin-bottom:10px;display:none">
+    实时看板需要通过本地应用访问（selftrack 命令起的 :8791），file:// 直开时不可用。</div>
+  <div class="sess" id="liveSessions"></div>
 </div>
 
 <div id="view-daily">

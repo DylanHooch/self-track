@@ -168,7 +168,10 @@ def to_day(epoch: float) -> str:
 class DB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path))
+        # timeout：写者撞锁等待而非立刻 OperationalError；WAL：serve 长驻后
+        # scan-light 写与看板 GET 读真正并发（review P1），WAL 允许单写多读
+        self.conn = sqlite3.connect(str(path), timeout=10)
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()

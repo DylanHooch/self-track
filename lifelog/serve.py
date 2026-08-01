@@ -77,6 +77,77 @@ def _start_analysis(source: str, sid: str) -> str:
     return label
 
 
+def _live_sessions(db: DB, hours: float) -> list[dict]:
+    """近 N 小时活跃会话（看板数据）。活跃 = 最后一条消息时间落在窗口内
+    （started_at 兜底：个别会话没有 ended_at）。纯读 DB——完整 run 落库的
+    digest 卡在这里直接复用（用户决策：看板与日报同源）。"""
+    from datetime import datetime, timedelta
+    cutoff = datetime.now().astimezone() - timedelta(hours=hours)
+    rows = db.conn.execute(
+        """SELECT source, session_id, title, cwd, project, started_at, ended_at,
+                  n_user_msgs, n_assistant_msgs, n_tool_calls, digest_status, digest_json
+           FROM sessions""").fetchall()
+    out = []
+    for r in rows:
+        last = r["ended_at"] or r["started_at"]
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except (TypeError, ValueError):
+            continue  # 时间戳坏了的会话不进实时看板（全量视图另有日报 tab）
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.astimezone()
+        if last_dt < cutoff:
+            continue
+        item = {"source": r["source"], "session_id": r["session_id"],
+                "title": r["title"], "cwd": r["cwd"], "project": r["project"],
+                "started_at": r["started_at"], "ended_at": r["ended_at"],
+                "last_active": last, "_last_dt": last_dt,
+                "n_user_msgs": r["n_user_msgs"], "n_assistant_msgs": r["n_assistant_msgs"],
+                "n_tool_calls": r["n_tool_calls"], "digest_status": r["digest_status"]}
+        if r["digest_json"]:
+            try:
+                card = json.loads(r["digest_json"])
+                if isinstance(card, dict):
+                    # 裁剪：看板卡片只展示 what/状态，整卡（ideas 等）留给日报
+                    item["digest"] = {"what": card.get("what"),
+                                      "progress_state": card.get("progress_state")}
+            except json.JSONDecodeError:
+                pass
+        out.append(item)
+    out.sort(key=lambda x: x["_last_dt"], reverse=True)  # 最近活跃在前（实时语义）；
+    for it in out:  # 按解析后的 datetime 排（字符串排序靠同 offset 假设，review P2）
+        del it["_last_dt"]
+    return out
+
+
+def _scan_light() -> dict:
+    """轻扫描：只 scan 落库，不算日统计/不 build-web/不调 LLM（用户决策：
+    看板刷新必须纯脚本）。与 launchd 每日 run 互斥——撞锁明确报回，不排队。"""
+    import fcntl
+    from .scan import scan
+    lock_path = DATA / "lifelog.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as fd:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"ok": False, "busy": True,
+                    "error": "另一个 lifelog 流程正在运行（每日批处理？），稍后再刷新"}
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            affected, warnings = scan(db)
+            # scan 内 finish_run 已把统计写进 scan_runs，最后一条即本次
+            run = db.conn.execute(
+                "SELECT n_scanned, n_new, n_skipped, n_failed FROM scan_runs "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            db.close()
+    return {"ok": True, "affected_days": sorted(affected), "warnings": warnings[:20],
+            "n_warnings": len(warnings),
+            "n_scanned": run["n_scanned"], "n_new": run["n_new"],
+            "n_skipped": run["n_skipped"], "n_failed": run["n_failed"]}
+
+
 def _copy_artifacts(db: DB, ids: list, out_dir: Path):
     """把产物的当前内容复制到 out_dir 并构建 manifest 条目（复制语义，原文件不动；
     commit 类无文件可拷，只进 manifest）。返回 (items, copied, skipped)。"""
@@ -135,10 +206,34 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "state": _dispatch_status(label)})
             return
+        if self.path.startswith("/api/live-sessions"):
+            self._get_live_sessions()
+            return
         if self.path.startswith("/api/artifact/raw"):
             self._get_artifact_raw()
             return
         super().do_GET()
+
+    def _get_live_sessions(self):
+        """实时看板数据：近 N 小时活跃会话。只读 DB 不扫描——刷新扫描由
+        POST /api/scan-light 显式触发（用户决策：看板不自动触发任何动作）。"""
+        from datetime import datetime
+        from urllib.parse import parse_qs, urlparse
+        import math
+        try:
+            hours = float(parse_qs(urlparse(self.path).query).get("hours", ["8"])[0])
+            if not math.isfinite(hours):  # nan 不抛 ValueError，timedelta(nan) 才炸（review P2）
+                raise ValueError
+            hours = min(max(hours, 0.5), 72)  # 防呆：窗口钳在 [0.5, 72] 小时
+        except ValueError:
+            hours = 8.0
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            sessions = _live_sessions(db, hours)
+        finally:
+            db.close()
+        self._json(200, {"ok": True, "hours": hours, "sessions": sessions,
+                         "server_now": datetime.now().astimezone().isoformat(timespec="seconds")})
 
     # 预览用内容类型（file:// 打开不了本地文件，预览只能走 serve）
     _RAW_CONTENT_TYPES = {
@@ -219,6 +314,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/deep-dive":
             self._post_deep_dive()
+        elif self.path == "/api/scan-light":
+            self._post_scan_light()
         elif self.path == "/api/artifact/path":
             self._post_artifact_path()
         elif self.path == "/api/pack":
@@ -227,6 +324,24 @@ class Handler(SimpleHTTPRequestHandler):
             self._post_pack_session()
         else:
             self._json(404, {"ok": False, "error": "unknown endpoint"})
+
+    def _post_scan_light(self):
+        """看板刷新：纯增量扫描落库（无 LLM、无日统计、无 build-web）。
+        同步在请求线程跑（全部源 stat 一遍 + 只解析有变化的会话，秒级；
+        ThreadingHTTPServer 下其他请求不受阻）。body 可为空。"""
+        try:  # body 不解析但要读掉：keep-alive 下残留 body 会污染同连接下一请求（review P2）
+            length = int(self.headers.get("Content-Length", 0))
+            if 0 < length <= MAX_BODY:
+                self.rfile.read(length)
+        except Exception:
+            pass
+        try:
+            result = _scan_light()
+        except Exception as e:
+            print(f"[serve] POST /api/scan-light 500: {e}", file=sys.stderr)
+            self._json(500, {"ok": False, "error": str(e)[:300]})
+            return
+        self._json(200 if result.get("ok") else 409, result)
 
     def _post_artifact_path(self):
         """用户补录产物被移动后的新路径（产物一般是用户自己移的，他知道在哪）。"""

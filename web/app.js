@@ -345,10 +345,12 @@ function switchTab(name) {
   document.querySelectorAll('.tabbar button').forEach(x =>
     x.classList.toggle('on', x.dataset.tab === name));
   $('#view-daily').style.display = name === 'daily' ? '' : 'none';
+  $('#view-live').style.display = name === 'live' ? '' : 'none';
   $('#view-ideas').style.display = name === 'ideas' ? '' : 'none';
   $('#view-promises').style.display = name === 'promises' ? '' : 'none';
   $('#view-projects').style.display = name === 'projects' ? '' : 'none';
   $('#view-artifacts').style.display = name === 'artifacts' ? '' : 'none';
+  if (name === 'live') renderLive();
   if (name === 'ideas') renderBoard();
   if (name === 'promises') renderPromises();
   if (name === 'projects') renderProjects();
@@ -466,6 +468,94 @@ $('#artFilter').oninput = () => renderArtifacts();
 document.querySelectorAll('#artTypeBar input').forEach(c => {
   c.onchange = () => renderArtifacts();
 });
+
+// ——— 实时看板（仅 serve 模式）：近 8 小时活跃会话。GET 只读库（完整 run 的数据
+// 直接复用）；「刷新」才触发 POST /api/scan-light 纯扫描（无 AI），不自动触发 ———
+const LIVE_HOURS = 8;
+function relLabel(iso, nowMs) {
+  const t = new Date(iso).getTime();              // ISO 带时区偏移，Date 直接可解
+  if (isNaN(t)) return '';
+  const mins = Math.max(0, Math.round((nowMs - t) / 60000));
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return mins + ' 分钟前';
+  const h = Math.floor(mins / 60);
+  if (h < LIVE_HOURS) return h + ' 小时前';
+  return iso.slice(5, 16).replace('T', ' ');
+}
+
+async function renderLive() {
+  const box = $('#liveSessions'), meta = $('#liveMeta'), hint = $('#liveHint');
+  if (!ON_SERVE) {
+    hint.style.display = '';                       // file:// 直开：说明后留空
+    box.innerHTML = '';
+    return;
+  }
+  hint.style.display = 'none';
+  try {
+    const r = await fetch(`/api/live-sessions?hours=${LIVE_HOURS}`);
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || '加载失败');
+    renderLiveCards(box, j.sessions, new Date(j.server_now).getTime());
+    if (!meta.dataset.scanned)                     // 没手动扫过：标明数据时点
+      meta.textContent = `近 ${LIVE_HOURS} 小时活跃 · ${j.sessions.length} 个会话 · 数据时点 ${j.server_now.slice(11, 19)}（点「刷新」扫描最新）`;
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--ink-dim);font-size:13px">加载失败：${esc(e.message || String(e))}</div>`;
+  }
+}
+
+function renderLiveCards(box, list, nowMs) {
+  if (!list.length) {
+    box.innerHTML = `<div style="color:var(--ink-dim);font-size:13px">近 ${LIVE_HOURS} 小时没有活跃会话。点「刷新」做一次纯扫描看看最新情况。</div>`;
+    return;
+  }
+  box.innerHTML = list.map((x, i) => {
+    const page = pageKey(x.source, x.session_id);
+    const ongoing = x.last_active && (nowMs - new Date(x.last_active).getTime()) < 10 * 60000;
+    return `
+    <div class="card" data-i="${i}">
+      <span class="copied">已复制 ✓</span>
+      <div class="src">${esc(x.source)}${ongoing ? ' <span class="badge live-on">进行中</span>' : ''}</div>
+      <div class="t">${esc(x.title || '(无标题)')}</div>
+      ${x.digest && x.digest.what ? `<div class="what">${esc(x.digest.what)}</div>` : ''}
+      <div class="meta"><span>${esc(relLabel(x.last_active, nowMs))}</span><span>${x.n_user_msgs} 条消息 · ${x.n_tool_calls} 次工具</span></div>
+      <a class="deep" href="deep/${page}.html">深度 →</a>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('.card').forEach(card => {
+    card.onclick = () => copyText(resumeText(list[+card.dataset.i]), card);
+  });
+  box.querySelectorAll('a.deep').forEach(el => {
+    el.onclick = e => e.stopPropagation();
+  });
+}
+
+$('#liveRefresh').onclick = async () => {
+  if (!ON_SERVE) { alert(NEED_SERVE_MSG); return; }
+  const btn = $('#liveRefresh'), meta = $('#liveMeta');
+  if (btn.disabled) return;                        // 防连点：扫描是串行的
+  btn.disabled = true; btn.textContent = '扫描中…';
+  try {
+    const r = await fetch('/api/scan-light', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const j = await r.json();
+    if (j.ok) {
+      const t = new Date();
+      const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
+      meta.dataset.scanned = '1';
+      meta.textContent = `扫描于 ${hh}:${mm} · 新解析 ${j.n_new} 个，无变化跳过 ${j.n_skipped} 个`
+        + (j.n_failed ? `，失败 ${j.n_failed} 个` : '')
+        + (j.n_warnings ? `（${j.n_warnings} 条警告，详见服务日志）` : '');
+      await renderLive();                          // 扫完重拉看板（renderLive 不覆盖 scanned 文案）
+    } else {
+      meta.textContent = j.error || '扫描失败';
+    }
+  } catch (e) {
+    meta.textContent = '扫描失败：' + (e.message || e);
+  } finally {
+    btn.disabled = false; btn.textContent = '刷新';
+  }
+};
+
 
 // ——— 产物预览（仅 serve 模式）：markdown 本地渲染，html/图片/pdf/视频走 iframe ———
 function miniMarkdown(src) {
@@ -823,4 +913,4 @@ renderDay();
 // hash 恢复放在最后：switchTab 依赖的 const（ARTIFACTS 等）必须都已初始化，
 // 否则带 #hash 刷新时 TDZ 报错会中断整个脚本（产物列表空白的根因）
 const _hashTab = (location.hash || '').slice(1);
-if (['ideas', 'promises', 'projects', 'artifacts'].includes(_hashTab)) switchTab(_hashTab);
+if (['live', 'ideas', 'promises', 'projects', 'artifacts'].includes(_hashTab)) switchTab(_hashTab);
