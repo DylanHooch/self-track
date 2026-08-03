@@ -1,7 +1,8 @@
 """前端构建：stats/daily/*.json → web/index.html（本地零外发，file:// 直开）。
 
 设计（docs/01 D5 + 2026-07-29 3D 重构）：
-- 数据内联为 JSON，转义 < > U+2028 U+2029 防 `</script>` 注入；只内联最近 90 天。
+- 数据内联为 JSON，转义 < > U+2028 U+2029 防 `</script>` 注入；全量内联
+  （实测 125 天仅 804KB；90 天窗口曾让 3 月会话在看板上"消失"，已取消）。
 - 本模板只是壳：样式在 web/style.css，逻辑在 web/app.js，3D hero 在 web/scene3d.js
   （three.js r147 vendor 在 web/vendor/，行者剪影内联在 web/sprite-walker.js）。
 - 「小人在路上」：3D 暮色山径——线框山脉 + 发光小径 + 数据路碑（可点击切日期）
@@ -16,7 +17,7 @@ from pathlib import Path
 from .aggregate import atomic_write_text
 from .db import DB
 
-MAX_DAYS = 90
+MAX_DAYS = None  # 全量内联（None=不设窗口）；要限窗口时给整数天数
 
 
 def _safe_inline_json(obj) -> str:
@@ -171,9 +172,11 @@ def compute_artifacts(db: DB, packed: dict[int, list[str]] | None = None) -> lis
     return out
 
 
-def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int = MAX_DAYS) -> Path:
+def build_web(db: DB, stats_dir: Path, web_dir: Path, max_days: int | None = MAX_DAYS) -> Path:
     daily_dir = stats_dir / "daily"
-    days = sorted(p.stem for p in daily_dir.glob("*.json"))[-max_days:]
+    days = sorted(p.stem for p in daily_dir.glob("*.json"))
+    if max_days:
+        days = days[-max_days:]
     payload_days = []
     for day in days:
         try:

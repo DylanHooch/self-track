@@ -150,6 +150,30 @@ def _scan_light() -> dict:
             "n_skipped": run["n_skipped"], "n_failed": run["n_failed"]}
 
 
+def _render_deep_page(db: DB, row) -> Path:
+    """按 DB 行现场渲染单个深度页（页面是 DB/manifest 的投影，随时可重建）。
+    返回输出路径。打包与 /deep/ 按需渲染共用。"""
+    from .adapters import all_adapters
+    from .deepdive import (load_manifest, render_page, safe_page_key,
+                           session_artifacts)
+    source = row["source"]
+    entry = load_manifest(WEB).get(safe_page_key(source, row["session_id"]))
+    if entry and not entry.get("analysis"):
+        entry = None
+    messages, stale = None, 0
+    try:
+        adapter = {a.source: a for a in all_adapters()}[source]
+        rs = adapter.parse(Path(row["raw_path"]))
+        messages = rs.messages
+        if entry:
+            stale = max(0, len(rs.messages) - entry.get("n_messages", 0))
+    except Exception:
+        if entry:
+            stale = -1  # 源文件不可用/解析失败（与"有新增"区分展示）
+    return render_page(row, WEB, entry, stale, messages,
+                       session_artifacts(db, source, row["session_id"]))
+
+
 def _copy_artifacts(db: DB, ids: list, out_dir: Path):
     """把产物的当前内容复制到 out_dir 并构建 manifest 条目（复制语义，原文件不动；
     commit 类无文件可拷，只进 manifest）。返回 (items, copied, skipped)。"""
@@ -214,7 +238,45 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/artifact/raw"):
             self._get_artifact_raw()
             return
+        if self.path.startswith("/deep/"):
+            self._get_deep_page()
+            return
         super().do_GET()
+
+    def _get_deep_page(self):
+        """深度页按需渲染：scan-light 入库的会话要等下次 build-web 才有页，
+        拦截 /deep/ 的 404 现场渲染再服务（页面是投影，单一会话渲染为毫秒级）。
+        文件名只放行 safe 字符，按 safe_page_key 逐会话反查，不存在任意渲染面。"""
+        from urllib.parse import unquote, urlparse
+        from .deepdive import safe_page_key
+        name = unquote(urlparse(self.path).path)[len("/deep/"):]
+        if not name.endswith(".html") or not re.fullmatch(r"[A-Za-z0-9._-]+", name[:-5]):
+            self._json(404, {"ok": False, "error": "bad page"})
+            return
+        if (WEB / "deep" / name).is_file():
+            super().do_GET()  # 已存在走静态服务
+            return
+        key = name[:-5]
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            rows = db.conn.execute("SELECT source, session_id FROM sessions").fetchall()
+            hit = next((r for r in rows
+                        if safe_page_key(r["source"], r["session_id"]) == key), None)
+            if not hit:
+                self._json(404, {"ok": False, "error": "会话不存在或已不在库"})
+                return
+            row = db.conn.execute(
+                "SELECT * FROM sessions WHERE source=? AND session_id=?",
+                (hit["source"], hit["session_id"])).fetchone()
+            try:
+                _render_deep_page(db, row)
+            except Exception as e:
+                print(f"[serve] /deep/ 按需渲染失败 {key}: {e}", file=sys.stderr)
+                self._json(500, {"ok": False, "error": str(e)[:200]})
+                return
+        finally:
+            db.close()
+        super().do_GET()  # 渲染完成，交给静态服务吐出去
 
     def _get_live_sessions(self):
         """实时看板数据：近 N 小时活跃会话。只读 DB 不扫描——刷新扫描由
@@ -425,7 +487,6 @@ class Handler(SimpleHTTPRequestHandler):
         import shutil
         from datetime import datetime
         from .deepdive import safe_page_key
-        from .adapters import all_adapters
         db = DB(DATA / "lifelog.sqlite")
         try:
             row = db.conn.execute(
@@ -449,22 +510,7 @@ class Handler(SimpleHTTPRequestHandler):
             page = WEB / "deep" / f"{safe_page_key(source, sid)}.html"
             # 打包前重渲深度页：磁盘页可能是旧代码/旧数据的投影
             # （踩过：旧版打出来的 session.html 没有完整对话区）
-            from .deepdive import load_manifest, render_page, session_artifacts
-            entry = load_manifest(WEB).get(safe_page_key(source, sid))
-            if entry and not entry.get("analysis"):
-                entry = None
-            messages, stale = None, 0
-            try:
-                adapter = {a.source: a for a in all_adapters()}[source]
-                rs = adapter.parse(Path(row["raw_path"]))
-                messages = rs.messages
-                if entry:
-                    stale = max(0, len(rs.messages) - entry.get("n_messages", 0))
-            except Exception:
-                if entry:
-                    stale = -1
-            render_page(row, WEB, entry, stale, messages,
-                        session_artifacts(db, source, sid))
+            _render_deep_page(db, row)
             if page.is_file():
                 shutil.copy2(page, out_dir / "session.html")
                 page_file = "session.html"
