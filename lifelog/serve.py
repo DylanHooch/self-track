@@ -210,6 +210,91 @@ def _copy_artifacts(db: DB, ids: list, out_dir: Path):
     return items, copied, skipped
 
 
+def find_session_pack(source: str, session_id: str,
+                      deliverables: Path | None = None) -> Path | None:
+    """扫 ~/Deliverables/*/manifest.json 找该会话的既有打包目录（扫描即真相，
+    与 packed_index 同哲学：目录被手工改名也能找到）。多个命中取最近打包的。"""
+    root = deliverables or (Path.home() / "Deliverables")
+    best = None
+    if not root.is_dir():
+        return None
+    for mf in root.glob("*/manifest.json"):
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        s = data.get("session")
+        if isinstance(s, dict) and s.get("source") == source \
+                and s.get("session_id") == session_id:
+            if best is None or str(data.get("packed_at", "")) > str(best[1]):
+                best = (mf.parent, str(data.get("packed_at", "")))
+    return best[0] if best else None
+
+
+def _sync_artifacts(db: DB, ids: list, out_dir: Path):
+    """增量同步产物到 out_dir：与上次 manifest 逐项比对，内容没变就跳过。
+    返回 (items, added, updated, unchanged, skipped)。复制语义，原文件不动；
+    commit 类无文件可拷，只进 manifest。"""
+    import filecmp
+    import shutil
+    old = {}
+    try:
+        data = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+        for it in data.get("items") or []:
+            if isinstance(it, dict) and isinstance(it.get("id"), int):
+                old[it["id"]] = it
+    except (OSError, ValueError):
+        pass  # 无旧 manifest / 损坏 → 全部按新增处理
+    items, added, updated, unchanged, skipped = [], 0, 0, 0, 0
+    for aid in ids:
+        r = db.conn.execute(
+            "SELECT kind, name, path, path_override, repo, first_day, last_day, note "
+            "FROM artifacts WHERE id=?", (aid,)).fetchone()
+        if not r:
+            continue
+        entry = {"id": aid, "kind": r["kind"], "name": r["name"],
+                 "first_day": r["first_day"], "last_day": r["last_day"],
+                 "note": r["note"]}
+        if r["kind"] == "commit":
+            entry["repo"] = r["repo"]
+            items.append(entry)
+            continue
+        src = r["path_override"] or r["path"]
+        entry["original_path"] = r["path"]
+        prev_copy = (old.get(aid) or {}).get("copied_as")
+        if not src or not Path(src).is_file():
+            # 原件没了：保留上次打包记录，packed_index 仍能找到副本（用户决策）
+            if prev_copy and (out_dir / prev_copy).is_file():
+                entry["copied_as"] = prev_copy
+                entry["skipped"] = "文件已不存在（保留上次打包副本）"
+            else:
+                entry["skipped"] = "文件已不存在"
+            items.append(entry)
+            skipped += 1
+            continue
+        dest_name = prev_copy or Path(src).name
+        dest = out_dir / dest_name
+        if dest.is_file() and filecmp.cmp(src, dest, shallow=False):
+            entry["copied_as"] = dest_name
+            items.append(entry)
+            unchanged += 1
+            continue
+        if dest.exists() and not prev_copy:
+            dest = out_dir / f"{aid}-{Path(src).name}"  # 撞名且不是本包旧副本
+            dest_name = dest.name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        entry["copied_as"] = dest_name
+        items.append(entry)
+        if prev_copy:
+            updated += 1
+        else:
+            added += 1
+    return items, added, updated, unchanged, skipped
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB), **kwargs)
@@ -244,39 +329,53 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def _get_deep_page(self):
-        """深度页按需渲染：scan-light 入库的会话要等下次 build-web 才有页，
-        拦截 /deep/ 的 404 现场渲染再服务（页面是投影，单一会话渲染为毫秒级）。
-        文件名只放行 safe 字符，按 safe_page_key 逐会话反查，不存在任意渲染面。"""
+        """深度页服务：文件缺失或源文件有更新时先现场渲染再服务（页面是投影）。
+        scan-light 只落库不刷页，进行中的会话持续写入——按 源水位>页面mtime
+        判定重渲，详情页不再停留在几小时前（用户踩过）。文件名只放行 safe
+        字符，按 safe_page_key 逐会话反查，不存在任意渲染面。"""
         from urllib.parse import unquote, urlparse
         from .deepdive import safe_page_key
         name = unquote(urlparse(self.path).path)[len("/deep/"):]
         if not name.endswith(".html") or not re.fullmatch(r"[A-Za-z0-9._-]+", name[:-5]):
             self._json(404, {"ok": False, "error": "bad page"})
             return
-        if (WEB / "deep" / name).is_file():
-            super().do_GET()  # 已存在走静态服务
-            return
+        page = WEB / "deep" / name
         key = name[:-5]
         db = DB(DATA / "lifelog.sqlite")
         try:
             rows = db.conn.execute("SELECT source, session_id FROM sessions").fetchall()
             hit = next((r for r in rows
                         if safe_page_key(r["source"], r["session_id"]) == key), None)
-            if not hit:
+            if hit:
+                row = db.conn.execute(
+                    "SELECT * FROM sessions WHERE source=? AND session_id=?",
+                    (hit["source"], hit["session_id"])).fetchone()
+                if self._deep_page_stale(page, row):
+                    try:
+                        _render_deep_page(db, row)
+                    except Exception as e:  # 渲染失败不挡路：退而服务现有页
+                        print(f"[serve] /deep/ 渲染失败 {key}: {e}", file=sys.stderr)
+            elif not page.is_file():
                 self._json(404, {"ok": False, "error": "会话不存在或已不在库"})
-                return
-            row = db.conn.execute(
-                "SELECT * FROM sessions WHERE source=? AND session_id=?",
-                (hit["source"], hit["session_id"])).fetchone()
-            try:
-                _render_deep_page(db, row)
-            except Exception as e:
-                print(f"[serve] /deep/ 按需渲染失败 {key}: {e}", file=sys.stderr)
-                self._json(500, {"ok": False, "error": str(e)[:200]})
                 return
         finally:
             db.close()
-        super().do_GET()  # 渲染完成，交给静态服务吐出去
+        super().do_GET()  # 已渲染/本就新鲜/孤儿页，都交给静态服务
+
+    @staticmethod
+    def _deep_page_stale(page: Path, row) -> bool:
+        """页面缺失，或会话源文件的现场水位比页面新 → 需要重渲。"""
+        if not page.is_file():
+            return True
+        try:
+            from .adapters import all_adapters
+            adapter = {a.source: a for a in all_adapters()}.get(row["source"])
+            raw = Path(row["raw_path"]) if row["raw_path"] else None
+            if not adapter or not raw or not raw.exists():
+                return False  # 源文件没了：现有页已是最佳可得
+            return adapter.mtime_of(raw) > page.stat().st_mtime
+        except Exception:
+            return False
 
     def _get_live_sessions(self):
         """实时看板数据：近 N 小时活跃会话。只读 DB 不扫描——刷新扫描由
@@ -386,6 +485,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._post_pack()
         elif self.path == "/api/pack-session":
             self._post_pack_session()
+        elif self.path == "/api/pack-current":
+            self._post_pack_current()
         else:
             self._json(404, {"ok": False, "error": "unknown endpoint"})
 
@@ -473,8 +574,6 @@ class Handler(SimpleHTTPRequestHandler):
         self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied, "skipped": skipped})
 
     def _post_pack_session(self):
-        """打包单个会话：会话详情页 + 该会话全部产物 → ~/Deliverables/<目录名>/。
-        目录名取用户输入（可空），默认会话标题；消毒路径分隔/控制符，撞名加 -2/-3。"""
         body = self._read_json()
         if body is None:
             return
@@ -484,6 +583,59 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception:
             self._json(400, {"ok": False, "error": "bad request"})
             return
+        code, payload = self._pack_session_impl(source, sid, name)
+        self._json(code, payload)
+
+    def _post_pack_current(self):
+        """skill 入口：打包「当前」会话 = 指定 cwd 下最近活跃的会话。
+        先 scan-light 落库（进行中的会话在 DB 里可能是旧的甚至缺的），再挑选打包。"""
+        try:  # body 可为空或 {"cwd": ...}；读掉防 keep-alive 污染
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw_body = self.rfile.read(length) if 0 < length <= MAX_BODY else b""
+            body = json.loads(raw_body) if raw_body else {}
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            body = {}
+        cwd = str(body.get("cwd") or "").strip()[:500]
+        name = str(body.get("name") or "").strip()[:120]
+        result = _scan_light()
+        if not result.get("ok"):
+            self._json(409, result)  # 与每日批处理撞锁等，明确报回不排队
+            return
+        import os
+        def norm_path(p):
+            return os.path.realpath(os.path.expanduser(p.rstrip("/") or "/"))
+        db = DB(DATA / "lifelog.sqlite")
+        try:
+            rows = db.conn.execute(
+                "SELECT source, session_id, title, cwd, started_at, ended_at "
+                "FROM sessions").fetchall()
+            def last(r):
+                return r["ended_at"] or r["started_at"] or ""
+            cands = rows
+            if cwd:
+                target = norm_path(cwd)
+                matched = [r for r in rows
+                           if r["cwd"] and norm_path(r["cwd"]) == target]
+                if matched:
+                    cands = matched  # cwd 有命中就收窄；没命中退化为全局最近
+            best = max(cands, key=last, default=None)
+            if not best:
+                self._json(404, {"ok": False, "error": "库里还没有任何会话"})
+                return
+        finally:
+            db.close()
+        code, payload = self._pack_session_impl(best["source"], best["session_id"], name)
+        payload["session"] = {"source": best["source"], "session_id": best["session_id"],
+                              "title": best["title"]}
+        self._json(code, payload)
+
+    def _pack_session_impl(self, source: str, sid: str, name: str):
+        """打包单个会话（增量）：会话详情页 + 原会话记录 + 全部产物 → ~/Deliverables/<目录>/。
+        首次：目录名取输入（可空）默认会话标题，消毒分隔符，撞名加 -2/-3。
+        再次：按 manifest 的 session 记录找到已有目录，只更新变化的内容。
+        返回 (http_code, payload)。"""
         import shutil
         from datetime import datetime
         from .deepdive import safe_page_key
@@ -493,19 +645,23 @@ class Handler(SimpleHTTPRequestHandler):
                 "SELECT * FROM sessions WHERE source=? AND session_id=?",
                 (source, sid)).fetchone()
             if not row:
-                self._json(404, {"ok": False, "error": f"找不到会话 {source}:{sid}"})
-                return
+                return 404, {"ok": False, "error": f"找不到会话 {source}:{sid}"}
             ids = [r["artifact_id"] for r in db.conn.execute(
                 "SELECT artifact_id FROM artifact_sessions WHERE source=? AND session_id=?",
                 (source, sid)).fetchall()]
-            base = re.sub(r"[/\\\x00-\x1f]+", "_", name or row["title"] or "").strip(" .")
-            base = base[:80] or safe_page_key(source, sid)
-            root = Path.home() / "Deliverables"
-            out_dir, n = root / base, 2
-            while out_dir.exists():
-                out_dir = root / f"{base}-{n}"
-                n += 1
-            out_dir.mkdir(parents=True)
+            existing = find_session_pack(source, sid)
+            incremental = existing is not None
+            if incremental:
+                out_dir = existing  # 增量：目录已存在即稳定，自定义名只在首次生效
+            else:
+                base = re.sub(r"[/\\\x00-\x1f]+", "_", name or row["title"] or "").strip(" .")
+                base = base[:80] or safe_page_key(source, sid)
+                root = Path.home() / "Deliverables"
+                out_dir, n = root / base, 2
+                while out_dir.exists():
+                    out_dir = root / f"{base}-{n}"
+                    n += 1
+                out_dir.mkdir(parents=True)
             page_file = None
             page = WEB / "deep" / f"{safe_page_key(source, sid)}.html"
             # 打包前重渲深度页：磁盘页可能是旧代码/旧数据的投影
@@ -514,8 +670,7 @@ class Handler(SimpleHTTPRequestHandler):
             if page.is_file():
                 shutil.copy2(page, out_dir / "session.html")
                 page_file = "session.html"
-            # 原会话记录（复制语义）：jsonl 源拷单文件；kimi-code 是目录，拷
-            # state.json + agents/main/wire.jsonl（与 adapter 解析范围一致）
+            # 原会话记录（复制语义，每次全量覆盖：进行中的会话 raw 一直在长）
             raw_files = []
             try:
                 # Path() 挪进 try：raw_path 混入 NUL 等坏值时 ValueError 也有兜底（review P2）
@@ -537,9 +692,18 @@ class Handler(SimpleHTTPRequestHandler):
                     print(f"  warning: 原会话已不在磁盘: {raw}", file=sys.stderr)
             except (OSError, ValueError) as e:
                 print(f"  warning: 打包原会话失败: {e}", file=sys.stderr)
-            items, copied, skipped = _copy_artifacts(db, ids, out_dir)
+            first_packed_at = None
+            if incremental:
+                try:
+                    old = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+                    first_packed_at = old.get("packed_at")
+                except (OSError, ValueError):
+                    pass
+            items, added, updated, unchanged, skipped = _sync_artifacts(db, ids, out_dir)
+            packed_at = datetime.now().isoformat(timespec="seconds")
             (out_dir / "manifest.json").write_text(
-                json.dumps({"packed_at": datetime.now().isoformat(timespec="seconds"),
+                json.dumps({"packed_at": packed_at,
+                            "first_packed_at": first_packed_at or packed_at,
                             "session": {"source": source, "session_id": sid,
                                         "title": row["title"], "cwd": row["cwd"],
                                         "started_at": row["started_at"],
@@ -549,8 +713,10 @@ class Handler(SimpleHTTPRequestHandler):
                 encoding="utf-8")
         finally:
             db.close()
-        self._json(200, {"ok": True, "dir": str(out_dir), "copied": copied,
-                         "skipped": skipped, "raw_files": raw_files})
+        return 200, {"ok": True, "dir": str(out_dir), "incremental": incremental,
+                     "added": added, "updated": updated, "unchanged": unchanged,
+                     "copied": added + updated, "skipped": skipped,
+                     "raw_files": raw_files}
 
     def _post_deep_dive(self):
         body = self._read_json()

@@ -589,7 +589,11 @@ async function doPack() {{
     const d = await r.json();
     if (d.ok) {{
       document.getElementById('packForm').style.display = 'none';
-      toast(`已打包到 ${{d.dir}}（复制 ${{d.copied}} 个文件${{d.skipped ? `，跳过 ${{d.skipped}} 个` : ''}}）`);
+      const parts = d.incremental
+        ? [`新增 ${{d.added || 0}}`, `更新 ${{d.updated || 0}}`, `未变 ${{d.unchanged || 0}}`]
+        : [`复制 ${{d.copied}} 个文件`];
+      if (d.skipped) parts.push(`跳过 ${{d.skipped}}`);
+      toast(`已${{d.incremental ? '增量更新' : '打包'}}到 ${{d.dir}}（${{parts.join('，')}}）`);
     }} else toast('打包失败：' + (d.error || r.status));
   }} catch (e) {{ toast('打包失败：' + e); }}
   btn.disabled = false; btn.textContent = '确认打包';
